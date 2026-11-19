@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body {
+    font-family: 'Heebo', 'Assistant', 'Rubik', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    direction: rtl;
+  }
+}

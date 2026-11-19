@@ -1,0 +1,175 @@
+{
+  "generatedAt": "2026-11-18T15:30:21.331288+00:00",
+  "device": "cuda",
+  "gamesPerPair": 16,
+  "totalGamesPlayed": 320,
+  "leaderboard": [
+    {
+      "depth": 2,
+      "label": "Depth 2+ (מאסטר AI)",
+      "elo": 1846.8,
+      "winRatePct": 55.47,
+      "ppg": 0.1641,
+      "avgMoveTimeMs": 0.92,
+      "gamesPlayed": 128
+    },
+    {
+      "depth": 3,
+      "label": "Depth 3+ (רב-אמן AI)",
+      "elo": 1816.3,
+      "winRatePct": 50.0,
+      "ppg": 0.0391,
+      "avgMoveTimeMs": 1.44,
+      "gamesPlayed": 128
+    },
+    {
+      "depth": 4,
+      "label": "Depth 4+ (אלוף-על AI)",
+      "elo": 1811.9,
+      "winRatePct": 49.22,
+      "ppg": 0.0234,
+      "avgMoveTimeMs": 2.27,
+      "gamesPlayed": 128
+    },
+    {
+      "depth": 5,
+      "label": "Depth 5+ (אלגוריתם-על AI)",
+      "elo": 1803.2,
+      "winRatePct": 47.66,
+      "ppg": -0.1172,
+      "avgMoveTimeMs": 3.33,
+      "gamesPlayed": 128
+    },
+    {
+      "depth": 1,
+      "label": "Depth 1 (מאמן AI)",
+      "elo": 1800.0,
+      "winRatePct": 47.66,
+      "ppg": -0.1094,
+      "avgMoveTimeMs": 0.33,
+      "gamesPlayed": 128
+    }
+  ],
+  "headToHead": [
+    {
+      "depthA": 2,
+      "depthB": 1,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 53.12,
+      "gammonRateA": 25.0,
+      "ppgA": 0.25,
+      "eloDiffA": 21.7,
+      "avgMoveMsA": 1.03,
+      "avgMoveMsB": 0.32
+    },
+    {
+      "depthA": 3,
+      "depthB": 1,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 53.12,
+      "gammonRateA": 12.5,
+      "ppgA": 0.1562,
+      "eloDiffA": 21.7,
+      "avgMoveMsA": 1.13,
+      "avgMoveMsB": 0.25
+    },
+    {
+      "depthA": 4,
+      "depthB": 1,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 43.75,
+      "gammonRateA": 15.62,
+      "ppgA": -0.0625,
+      "eloDiffA": -43.7,
+      "avgMoveMsA": 1.9,
+      "avgMoveMsB": 0.36
+    },
+    {
+      "depthA": 5,
+      "depthB": 1,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 59.38,
+      "gammonRateA": 12.5,
+      "ppgA": 0.0938,
+      "eloDiffA": 65.9,
+      "avgMoveMsA": 3.49,
+      "avgMoveMsB": 0.38
+    },
+    {
+      "depthA": 3,
+      "depthB": 2,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 40.62,
+      "gammonRateA": 12.5,
+      "ppgA": -0.1562,
+      "eloDiffA": -65.9,
+      "avgMoveMsA": 1.54,
+      "avgMoveMsB": 0.87
+    },
+    {
+      "depthA": 4,
+      "depthB": 2,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 50.0,
+      "gammonRateA": 9.38,
+      "ppgA": 0.0,
+      "eloDiffA": -0.0,
+      "avgMoveMsA": 2.12,
+      "avgMoveMsB": 0.97
+    },
+    {
+      "depthA": 5,
+      "depthB": 2,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 40.62,
+      "gammonRateA": 12.5,
+      "ppgA": -0.25,
+      "eloDiffA": -65.9,
+      "avgMoveMsA": 3.24,
+      "avgMoveMsB": 0.79
+    },
+    {
+      "depthA": 4,
+      "depthB": 3,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 40.62,
+      "gammonRateA": 9.38,
+      "ppgA": -0.2188,
+      "eloDiffA": -65.9,
+      "avgMoveMsA": 2.61,
+      "avgMoveMsB": 1.61
+    },
+    {
+      "depthA": 5,
+      "depthB": 3,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 53.12,
+      "gammonRateA": 6.25,
+      "ppgA": 0.0625,
+      "eloDiffA": 21.7,
+      "avgMoveMsA": 2.94,
+      "avgMoveMsB": 1.49
+    },
+    {
+      "depthA": 5,
+      "depthB": 4,
+      "totalGames": 32,
+      "pairedGames": 16,
+      "winRateA": 37.5,
+      "gammonRateA": 18.75,
+      "ppgA": -0.375,
+      "eloDiffA": -88.7,
+      "avgMoveMsA": 3.66,
+      "avgMoveMsB": 2.46
+    }
+  ]
+}

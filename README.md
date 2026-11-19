@@ -24,7 +24,7 @@ An offline-first **Progressive Web App (PWA)** for playing, studying, and analyz
   * **What-If Sandbox:** Branch off any historical turn to test alternative plays and dice rolls live without mutating match history, plus full `.json` match export/import.
 * **📷 AI Vision Board Scanner (`Gemini Vision`):**
   * Supports digital app screenshots and real-life physical board photos via drag-and-drop, file upload, or `Ctrl+V` clipboard paste.
-  * Client-side preprocessing (auto-resize & contrast normalization) paired with a 3-model automatic fallback cascade (`gemini-2.5-flash` → `gemini-2.5-flash-lite` → `gemini-2.0-flash`).
+  * Client-side preprocessing (auto-resize & contrast normalization) paired with a 3-model automatic fallback cascade (`gemini-2.5-flash` -> `gemini-2.5-flash-lite` -> `gemini-2.0-flash`).
   * **Interactive Calibration Studio:** One-click `180°` board rotation, color swap, manual click-to-edit brush, turn/dice selection, and instant tactical analysis.
 * **🎮 Gameplay UX & Offline PWA:**
   * Multi-step combined dice moves (e.g., `3+4 = 7` and chained doubles) with strict Backgammon legality enforcement and undo support.
@@ -38,8 +38,8 @@ An offline-first **Progressive Web App (PWA)** for playing, studying, and analyz
 Unlike deterministic board games such as Chess, Backgammon is stochastic—every ply branches across **21 weighted dice outcomes**. To achieve strong, well-calibrated play across all phases of the game, the engine integrates **4 evaluation and search layers**:
 
 ### 1. Exact Bear-Off Tablebase (54,264 States — 100% Perfect Play)
-Once all 15 checkers enter a player's home board (6 points), there are exactly $\binom{15+6}{6} = 54,264$ possible configurations.
-Using Dynamic Programming and bidirectional combinatorial indexing (`src/engine/bearoffTablebase.ts` & `training/bearoff_dp.py`), the engine precomputes exact turn-to-bear-off probability distributions $P(T = k)$ and convolves both players' distributions to deliver **exact mathematical equity** in every bear-off race.
+Once all 15 checkers enter a player's home board (6 points), there are exactly `C(21, 6) = 54,264` possible configurations.
+Using Dynamic Programming and bidirectional combinatorial indexing (`src/engine/bearoffTablebase.ts` & `training/bearoff_dp.py`), the engine precomputes exact turn-to-bear-off probability distributions `P(T = k)` and convolves both players' distributions to deliver **exact mathematical equity** in every bear-off race.
 
 ### 2. 3-Network Residual Architecture (`v3`) — 260 Grandmaster Features
 Every board state is deterministically classified into one of three distinct strategic phases (`Contact`, `Crashed`, `Race`) and evaluated by a dedicated Residual MLP (following TD-Gammon / GNU Backgammon principles) using a canonical, perspective-symmetric **260-feature vector**:
@@ -49,16 +49,16 @@ Every board state is deterministically classified into one of three distinct str
 
 | Specialized Network | Game Phase Specialization | Architecture (`SiLU` + `Residual`) | Output (`6-Class Softmax`) |
 | :--- | :--- | :--- | :--- |
-| **`ContactNet`** | Contact battles, primes, blitzes & Backgames | `260 → 512 → 2×Res(512) → 256 → 6` | `Win 1/2/3`, `Lose 1/2/3` |
-| **`CrashedNet`** | Crunched home boards (≤5 active checkers) & timing | `260 → 384 → Res(384) → 192 → 6` | `Win 1/2/3`, `Lose 1/2/3` |
-| **`RaceNet`** | Pure non-contact races & pip-wastage minimization | `260 → 384 → Res(384) → 192 → 6` | `Win 1/2/3`, `Lose 1/2/3` |
+| **`ContactNet`** | Contact battles, primes, blitzes & Backgames | `260 -> 512 -> 2×Res(512) -> 256 -> 6` | `Win 1/2/3`, `Lose 1/2/3` |
+| **`CrashedNet`** | Crunched home boards (<=5 active checkers) & timing | `260 -> 384 -> Res(384) -> 192 -> 6` | `Win 1/2/3`, `Lose 1/2/3` |
+| **`RaceNet`** | Pure non-contact races & pip-wastage minimization | `260 -> 384 -> Res(384) -> 192 -> 6` | `Win 1/2/3`, `Lose 1/2/3` |
 
 ### 3. Massive Local GPU Training — 15,000,512 Self-Play Games
 All three networks were trained locally using **PyTorch (CUDA 12.4)** on an **NVIDIA GeForce RTX 4070 SUPER (12GB VRAM)** with a high-throughput multi-core simulation pipeline:
 * **Numba `@njit(parallel=True)` Engine:** Compiled Backgammon move generation, state transitions, and 260-feature extraction to native machine code across all CPU cores (`prange`), accelerating self-play throughput from ~20 games/sec to **1,323–1,465 games/sec (~70× speedup)**.
 * **4,096-Environment Mega-Batching (`TF32` + `BFloat16`):**
   1. **Stage 1 — Supervised Warm-Start:** Stratified pre-training across balanced Contact, Crashed, and Race positions evaluated via 2-ply Expectiminimax and the exact bear-off tablebase.
-  2. **Stage 2 — Hybrid $\text{TD}(\lambda=0.7)$ + 2-Ply AlphaZero Distillation:** Combines temporal-difference eligibility traces with batched 2-ply Expectiminimax target distribution distillation.
+  2. **Stage 2 — Hybrid `TD(λ=0.7)` + 2-Ply AlphaZero Distillation:** Combines temporal-difference eligibility traces with batched 2-ply Expectiminimax target distribution distillation.
   3. **Hard-Example Curriculum Injection (`--hard-ratio 0.30`):** 30% of environment resets inject rare, high-complexity tactical archetypes (`2-3 Backgames`, `Deep Holding Games`, `Mutual Prime Battles`, and `Crunched Boards`).
 * **Final Training Metrics:**
   * **Total Self-Play Volume:** `15,000,512` full games (~825M board evaluations) completed in `3h 08m`.
@@ -134,7 +134,7 @@ VITE_GEMINI_API_KEY=your_gemini_api_key_here
 ```powershell
 python -m venv training\.venv
 .\training\.venv\Scripts\Activate.ps1
-pip install torch --index-url [https://download.pytorch.org/whl/cu124](https://download.pytorch.org/whl/cu124)
+pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install -r training\requirements.txt
 
 # Run mega-batched GPU self-play training (auto-resumes from latest checkpoint)
@@ -147,5 +147,4 @@ python training\tournament_benchmark.py --games-per-pair 1000
 ---
 
 ## 🧪 Testing & Verification
-The engine is verified by automated **Vitest** unit test suites (`rules.test.ts`, `bearoffTablebase.test.ts`, `neuralNet.test.ts`, `ai.test.ts`, `visionScanner.test.ts`, `review.test.ts`) covering move legality and combined steps, combinatorial bear-off indexing, 260-feature perspective symmetry, 36-roll combinatorics bounds, vision calibration transforms, and Game Review accuracy math.#   b a c k g a m m o n - a i  
- 
+The engine is verified by automated **Vitest** unit test suites (`rules.test.ts`, `bearoffTablebase.test.ts`, `neuralNet.test.ts`, `ai.test.ts`, `visionScanner.test.ts`, `review.test.ts`) covering move legality and combined steps, combinatorial bear-off indexing, 260-feature perspective symmetry, 36-roll combinatorics bounds, vision calibration transforms, and Game Review accuracy math.
