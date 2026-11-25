@@ -6,6 +6,7 @@ import {
   GEMINI_VISION_MODELS,
   normalizeScannedBoard,
   scanBackgammonImage,
+  ScanCancelledError,
   swapBoardColors,
 } from './visionScanner';
 
@@ -107,48 +108,53 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
   });
 
   describe('scanBackgammonImage multi-model fallback cascade', () => {
-    it('cascades through gemini-2.5-flash -> gemini-2.5-pro -> gemini-2.5-flash-lite on HTTP 429/503', async () => {
+    it('cascades through gemini-2.5-flash (thinkingBudget=1024) -> gemini-2.5-flash-lite (thinkingBudget=0) on HTTP 429/503', async () => {
       expect(GEMINI_VISION_MODELS).toEqual([
         'gemini-2.5-flash',
-        'gemini-2.5-pro',
         'gemini-2.5-flash-lite',
       ]);
 
       const calledUrls: string[] = [];
-      const mockFetch = vi.fn(async (url: string | URL | Request) => {
-        const urlStr = String(url);
-        calledUrls.push(urlStr);
+      const thinkingBudgets: Array<number | undefined> = [];
+      const mockFetch = vi.fn(
+        async (url: string | URL | Request, init?: RequestInit) => {
+          const urlStr = String(url);
+          calledUrls.push(urlStr);
+          if (typeof init?.body === 'string') {
+            const bodyJson = JSON.parse(init.body);
+            thinkingBudgets.push(
+              bodyJson?.generationConfig?.thinkingConfig?.thinkingBudget
+            );
+          }
 
-        if (urlStr.includes('gemini-2.5-flash:')) {
-          return new Response('Rate limit exceeded', { status: 429 });
-        }
-        if (urlStr.includes('gemini-2.5-pro:')) {
-          return new Response('Service overloaded', { status: 503 });
-        }
-        return new Response(
-          JSON.stringify({
-            candidates: [
-              {
-                content: {
-                  parts: [
-                    {
-                      text: JSON.stringify({
-                        points: createInitialBoard().points,
-                        bar: { white: 0, black: 0 },
-                        borneOff: { white: 0, black: 0 },
-                        dice: [6, 1],
-                        detectedTurn: 'white',
-                        notes: 'זוהתה עמדת פתיחה עם 6-1 ללבן',
-                      }),
-                    },
-                  ],
+          if (urlStr.includes('gemini-2.5-flash:')) {
+            return new Response('Rate limit exceeded', { status: 429 });
+          }
+          return new Response(
+            JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        text: JSON.stringify({
+                          points: createInitialBoard().points,
+                          bar: { white: 0, black: 0 },
+                          borneOff: { white: 0, black: 0 },
+                          dice: [6, 1],
+                          detectedTurn: 'white',
+                          notes: 'זוהתה עמדת פתיחה עם 6-1 ללבן',
+                        }),
+                      },
+                    ],
+                  },
                 },
-              },
-            ],
-          }),
-          { status: 200 }
-        );
-      });
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+      );
 
       vi.stubGlobal('fetch', mockFetch);
       try {
@@ -157,10 +163,10 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
           'AIzaTestKey123'
         );
 
-        expect(calledUrls).toHaveLength(3);
+        expect(calledUrls).toHaveLength(2);
         expect(calledUrls[0]).toContain('gemini-2.5-flash:generateContent');
-        expect(calledUrls[1]).toContain('gemini-2.5-pro:generateContent');
-        expect(calledUrls[2]).toContain('gemini-2.5-flash-lite:generateContent');
+        expect(calledUrls[1]).toContain('gemini-2.5-flash-lite:generateContent');
+        expect(thinkingBudgets).toEqual([1024, 0]);
         expect(res.dice).toEqual([6, 1]);
         expect(res.detectedTurn).toBe('white');
       } finally {
@@ -232,9 +238,9 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
           'AIzaTestKey123'
         );
 
-        expect(calledUrls).toHaveLength(5);
-        expect(calledUrls[3]).toContain('/v1beta/models?key=AIzaTestKey123');
-        expect(calledUrls[4]).toContain(
+        expect(calledUrls).toHaveLength(4);
+        expect(calledUrls[2]).toContain('/v1beta/models?key=AIzaTestKey123');
+        expect(calledUrls[3]).toContain(
           'gemini-3.0-flash-preview:generateContent'
         );
         expect(res.dice).toEqual([5, 3]);
@@ -261,6 +267,26 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
             'AIzaTestKey123'
           )
         ).rejects.toThrow(/429/);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('aborts immediately when cancelled via external AbortSignal without cascading', async () => {
+      const controller = new AbortController();
+      controller.abort();
+
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      try {
+        await expect(
+          scanBackgammonImage(
+            'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+            'AIzaTestKey123',
+            controller.signal
+          )
+        ).rejects.toBeInstanceOf(ScanCancelledError);
+        expect(mockFetch).not.toHaveBeenCalled();
       } finally {
         vi.unstubAllGlobals();
       }

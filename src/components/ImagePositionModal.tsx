@@ -22,6 +22,7 @@ import type { BoardState, Player } from '../engine/types';
 import {
   flipBoard180,
   scanBackgammonImage,
+  ScanCancelledError,
   swapBoardColors,
 } from '../engine/visionScanner';
 
@@ -83,8 +84,11 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
   const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [scanElapsedSec, setScanElapsedSec] = useState<number>(0);
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanNotes, setScanNotes] = useState<string | null>(null);
+
+  const scanAbortRef = useRef<AbortController | null>(null);
 
   const [draftBoard, setDraftBoard] = useState<BoardState>(() => ({
     ...initialBoardState,
@@ -176,6 +180,34 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
     }
   };
 
+  useEffect(() => {
+    if (!isScanning) {
+      setScanElapsedSec(0);
+      return;
+    }
+    const start = Date.now();
+    const timer = window.setInterval(() => {
+      setScanElapsedSec(Math.floor((Date.now() - start) / 1000));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [isScanning]);
+
+  useEffect(() => {
+    if (!isOpen && scanAbortRef.current) {
+      scanAbortRef.current.abort();
+      scanAbortRef.current = null;
+    }
+  }, [isOpen]);
+
+  const handleCancelScan = () => {
+    if (scanAbortRef.current) {
+      scanAbortRef.current.abort();
+      scanAbortRef.current = null;
+    }
+    setIsScanning(false);
+    setScanError(null);
+  };
+
   const handleScanWithAI = async () => {
     if (!imageDataUrl) {
       setScanError('נא להעלות או להדביק תמונת לוח שש-בש תחילה.');
@@ -189,7 +221,12 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
       return;
     }
 
+    scanAbortRef.current?.abort();
+    const controller = new AbortController();
+    scanAbortRef.current = controller;
+
     setIsScanning(true);
+    setScanElapsedSec(0);
     setScanError(null);
     setScanNotes(null);
 
@@ -200,7 +237,13 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
         // Ignore storage errors
       }
 
-      const scanned = await scanBackgammonImage(imageDataUrl, apiKey);
+      const scanned = await scanBackgammonImage(
+        imageDataUrl,
+        apiKey,
+        controller.signal
+      );
+      if (controller.signal.aborted) return;
+
       setDraftBoard({
         points: [...scanned.points],
         bar: { ...scanned.bar },
@@ -220,12 +263,19 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
       }
       setScanNotes(scanned.notes);
     } catch (err) {
+      if (err instanceof ScanCancelledError || controller.signal.aborted) {
+        setScanError(null);
+        return;
+      }
       setScanError(
         err instanceof Error
           ? err.message
           : 'אירעה שגיאה בסריקת התמונה. ניתן לכייל את הלוח ידנית.'
       );
     } finally {
+      if (scanAbortRef.current === controller) {
+        scanAbortRef.current = null;
+      }
       setIsScanning(false);
     }
   };
@@ -600,7 +650,13 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
                   {isScanning ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      סורק לוח עם Gemini Vision...
+                      <span>
+                        סורק לוח עם AI... (
+                        <span dir="ltr" className="inline-block font-mono">
+                          {scanElapsedSec}s
+                        </span>
+                        )
+                      </span>
                     </>
                   ) : (
                     <>
@@ -609,6 +665,16 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
                     </>
                   )}
                 </button>
+
+                {isScanning && (
+                  <button
+                    type="button"
+                    onClick={handleCancelScan}
+                    className="px-3 py-2 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 text-xs font-bold transition-colors cursor-pointer"
+                  >
+                    ביטול
+                  </button>
+                )}
 
                 <button
                   type="button"

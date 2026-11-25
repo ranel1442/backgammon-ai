@@ -74,13 +74,13 @@ OUTPUT JSON SCHEMA (Return ONLY valid JSON matching this exact structure):
 
 /**
  * Client-side canvas image preprocessor:
- * Automatically resizes large photos/screenshots to max `1600px` dimension and applies
- * mild contrast normalization before sending to Gemini Vision for faster, sharper recognition.
+ * Automatically resizes large photos/screenshots to max `1024px` (longest edge) and exports
+ * as JPEG quality `0.82` with mild contrast normalization to cut upload & vision token latency.
  * Safely falls back to the original data URL in headless/test environments.
  */
 export async function preprocessBoardImage(
   base64DataUrl: string,
-  maxDimension = 1600
+  maxDimension = 1024
 ): Promise<string> {
   if (
     typeof document === 'undefined' ||
@@ -118,7 +118,7 @@ export async function preprocessBoardImage(
 
         ctx.filter = 'contrast(1.08) saturate(1.04)';
         ctx.drawImage(img, 0, 0, width, height);
-        const outUrl = canvas.toDataURL('image/jpeg', 0.9);
+        const outUrl = canvas.toDataURL('image/jpeg', 0.82);
         resolve(outUrl || base64DataUrl);
       } catch {
         resolve(base64DataUrl);
@@ -357,11 +357,25 @@ export function swapBoardColors(state: BoardState): BoardState {
 
 export const GEMINI_VISION_MODELS = [
   'gemini-2.5-flash',
-  'gemini-2.5-pro',
   'gemini-2.5-flash-lite',
 ] as const;
 
+export const GEMINI_REQUEST_TIMEOUT_MS = 20000;
+
 const RETRYABLE_HTTP_STATUSES = new Set([404, 429, 503]);
+
+export class ScanCancelledError extends Error {
+  constructor() {
+    super('הסריקה בוטלה.');
+    this.name = 'ScanCancelledError';
+  }
+}
+
+function getThinkingBudgetForModel(modelName: string): number {
+  const lower = modelName.toLowerCase();
+  if (lower.includes('lite')) return 0;
+  return 1024;
+}
 
 interface AttemptError {
   model: string;
@@ -425,35 +439,78 @@ async function invokeGeminiVisionModel(
   modelName: string,
   cleanKey: string,
   mimeType: string,
-  data: string
+  data: string,
+  externalSignal?: AbortSignal
 ): Promise<ScannedBoardResponse> {
+  if (externalSignal?.aborted) {
+    throw new ScanCancelledError();
+  }
+
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`;
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            { text: GEMINI_VISION_SYSTEM_PROMPT },
-            {
-              inline_data: {
-                mime_type: mimeType,
-                data,
-              },
-            },
-          ],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.1,
-        responseMimeType: 'application/json',
+  const timeoutController = new AbortController();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    timeoutController.abort();
+  }, GEMINI_REQUEST_TIMEOUT_MS);
+
+  const onExternalAbort = () => {
+    timeoutController.abort();
+  };
+  externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+
+  const generationConfig: Record<string, unknown> = {
+    temperature: 0.1,
+    responseMimeType: 'application/json',
+  };
+  if (modelName.includes('2.5')) {
+    generationConfig.thinkingConfig = {
+      thinkingBudget: getThinkingBudgetForModel(modelName),
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
       },
-    }),
-  });
+      signal: timeoutController.signal,
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              { text: GEMINI_VISION_SYSTEM_PROMPT },
+              {
+                inline_data: {
+                  mime_type: mimeType,
+                  data,
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig,
+      }),
+    });
+  } catch (fetchErr) {
+    if (externalSignal?.aborted) {
+      throw new ScanCancelledError();
+    }
+    if (timedOut) {
+      const timeoutErr = new Error(
+        `המודל ${modelName} חרג מזמן ההמתנה (${GEMINI_REQUEST_TIMEOUT_MS / 1000}s)`
+      ) as Error & { status?: number };
+      timeoutErr.status = 504;
+      throw timeoutErr;
+    }
+    throw fetchErr;
+  } finally {
+    clearTimeout(timeoutId);
+    externalSignal?.removeEventListener('abort', onExternalAbort);
+  }
 
   if (!response.ok) {
     const errBody = await response.text().catch(() => '');
@@ -542,20 +599,28 @@ function buildAggregatedVisionError(attemptErrors: AttemptError[]): Error {
 }
 
 /**
- * Calls Google Gemini Vision REST API with a multi-model fallback cascade
- * (`gemini-2.5-flash` -> `gemini-2.5-pro` -> `gemini-2.5-flash-lite`) on HTTP 429/503/404 errors,
+ * Calls Google Gemini Vision REST API with a fast capped-thinking fallback cascade
+ * (`gemini-2.5-flash` [budget 1024] -> `gemini-2.5-flash-lite` [budget 0]) with a 20s per-model timeout,
  * plus automatic Dynamic Model Discovery via `GET /v1beta/models` if all static models return 404.
  */
 export async function scanBackgammonImage(
   base64DataUrl: string,
-  apiKey: string
+  apiKey: string,
+  signal?: AbortSignal
 ): Promise<ScannedBoardResponse> {
   const cleanKey = apiKey.trim();
   if (!cleanKey) {
     throw new Error('נא להזין מפתח Gemini API תקין כדי לסרוק את התמונה.');
   }
+  if (signal?.aborted) {
+    throw new ScanCancelledError();
+  }
 
   const processedUrl = await preprocessBoardImage(base64DataUrl);
+  if (signal?.aborted) {
+    throw new ScanCancelledError();
+  }
+
   const { mimeType, data } = parseDataUrl(processedUrl);
   if (!data) {
     throw new Error('נתוני התמונה חסרים או לא תקינים.');
@@ -565,12 +630,24 @@ export async function scanBackgammonImage(
   const triedModels = new Set<string>();
 
   for (let i = 0; i < GEMINI_VISION_MODELS.length; i++) {
+    if (signal?.aborted) {
+      throw new ScanCancelledError();
+    }
     const modelName = GEMINI_VISION_MODELS[i];
     triedModels.add(modelName);
 
     try {
-      return await invokeGeminiVisionModel(modelName, cleanKey, mimeType, data);
+      return await invokeGeminiVisionModel(
+        modelName,
+        cleanKey,
+        mimeType,
+        data,
+        signal
+      );
     } catch (err) {
+      if (err instanceof ScanCancelledError || signal?.aborted) {
+        throw new ScanCancelledError();
+      }
       const typedErr = err as Error & { status?: number };
       const status = typedErr.status;
       attemptErrors.push({
@@ -580,7 +657,11 @@ export async function scanBackgammonImage(
       });
 
       // Stop early on non-retryable HTTP errors (e.g., 400/401/403 invalid API key)
-      if (status !== undefined && !RETRYABLE_HTTP_STATUSES.has(status)) {
+      if (
+        status !== undefined &&
+        status !== 504 &&
+        !RETRYABLE_HTTP_STATUSES.has(status)
+      ) {
         break;
       }
     }
@@ -591,22 +672,29 @@ export async function scanBackgammonImage(
     attemptErrors.length === GEMINI_VISION_MODELS.length &&
     attemptErrors.every((e) => e.status === 404);
 
-  if (allStatic404) {
+  if (allStatic404 && !signal?.aborted) {
     try {
       const discovered = await discoverActiveGeminiVisionModels(
         cleanKey,
         triedModels
       );
       for (const dynamicModel of discovered) {
+        if (signal?.aborted) {
+          throw new ScanCancelledError();
+        }
         triedModels.add(dynamicModel);
         try {
           return await invokeGeminiVisionModel(
             dynamicModel,
             cleanKey,
             mimeType,
-            data
+            data,
+            signal
           );
         } catch (err) {
+          if (err instanceof ScanCancelledError || signal?.aborted) {
+            throw new ScanCancelledError();
+          }
           const typedErr = err as Error & { status?: number };
           attemptErrors.push({
             model: dynamicModel,
@@ -616,6 +704,9 @@ export async function scanBackgammonImage(
         }
       }
     } catch (discoveryErr) {
+      if (discoveryErr instanceof ScanCancelledError) {
+        throw discoveryErr;
+      }
       attemptErrors.push({
         model: 'models-discovery',
         message:
