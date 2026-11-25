@@ -1,4 +1,4 @@
-const CACHE_NAME = 'backgammon-ai-master-v4';
+const CACHE_NAME = 'backgammon-ai-v5';
 const WEIGHTS_PATH = '/weights/backgammon_nn.json';
 const PRECACHE_URLS = [
   '/',
@@ -9,6 +9,19 @@ const PRECACHE_URLS = [
   '/manifest.webmanifest',
   WEIGHTS_PATH,
 ];
+
+function isNetworkFirstAsset(request, url) {
+  if (request.mode === 'navigate') return true;
+  const p = url.pathname;
+  return (
+    p === '/' ||
+    p.endsWith('.html') ||
+    p.endsWith('.js') ||
+    p.endsWith('.mjs') ||
+    p.endsWith('.css') ||
+    p.startsWith('/assets/')
+  );
+}
 
 self.addEventListener('install', (event) => {
   self.skipWaiting();
@@ -65,7 +78,29 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Cache-First with background revalidation for static shell assets
+  // Network-First strategy for HTML & JS/CSS bundles so new Vercel deployments always load immediately
+  if (isNetworkFirstAsset(request, url)) {
+    event.respondWith(
+      fetch(request, { cache: 'no-store' })
+        .then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200) {
+            const clone = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+          }
+          return networkResponse;
+        })
+        .catch(() =>
+          caches
+            .match(request)
+            .then((cached) =>
+              cached || (request.mode === 'navigate' ? caches.match('/index.html') : undefined)
+            )
+        )
+    );
+    return;
+  }
+
+  // Cache-First with background revalidation for static icons/images
   event.respondWith(
     caches.match(request).then((cachedResponse) => {
       const fetchPromise = fetch(request)

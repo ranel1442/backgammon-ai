@@ -3,6 +3,7 @@ import { evaluatePosition } from './evaluator';
 import { createInitialBoard } from './rules';
 import {
   flipBoard180,
+  GEMINI_REQUEST_TIMEOUT_MS,
   GEMINI_VISION_MODELS,
   normalizeScannedBoard,
   scanBackgammonImage,
@@ -108,10 +109,11 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
   });
 
   describe('scanBackgammonImage multi-model fallback cascade', () => {
-    it('cascades through gemini-2.5-flash (thinkingBudget=1024) -> gemini-2.5-flash-lite (thinkingBudget=0) on HTTP 429/503', async () => {
+    it('cascades through gemini-flash-latest (thinkingBudget=512) -> gemini-flash-lite-latest (thinkingBudget=0) with 90000ms timeout', async () => {
+      expect(GEMINI_REQUEST_TIMEOUT_MS).toBe(90000);
       expect(GEMINI_VISION_MODELS).toEqual([
-        'gemini-2.5-flash',
-        'gemini-2.5-flash-lite',
+        'gemini-flash-latest',
+        'gemini-flash-lite-latest',
       ]);
 
       const calledUrls: string[] = [];
@@ -127,7 +129,7 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
             );
           }
 
-          if (urlStr.includes('gemini-2.5-flash:')) {
+          if (urlStr.includes('gemini-flash-latest:')) {
             return new Response('Rate limit exceeded', { status: 429 });
           }
           return new Response(
@@ -164,9 +166,11 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
         );
 
         expect(calledUrls).toHaveLength(2);
-        expect(calledUrls[0]).toContain('gemini-2.5-flash:generateContent');
-        expect(calledUrls[1]).toContain('gemini-2.5-flash-lite:generateContent');
-        expect(thinkingBudgets).toEqual([1024, 0]);
+        expect(calledUrls[0]).toContain('gemini-flash-latest:generateContent');
+        expect(calledUrls[1]).toContain(
+          'gemini-flash-lite-latest:generateContent'
+        );
+        expect(thinkingBudgets).toEqual([512, 0]);
         expect(res.dice).toEqual([6, 1]);
         expect(res.detectedTurn).toBe('white');
       } finally {
@@ -174,7 +178,7 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
       }
     });
 
-    it('falls back to Dynamic Model Discovery (GET /v1beta/models) when all static models return HTTP 404', async () => {
+    it('strictly excludes -image, -tts, native-audio, robotics, and embedding models in Dynamic Model Discovery', async () => {
       const calledUrls: string[] = [];
       const mockFetch = vi.fn(async (url: string | URL | Request) => {
         const urlStr = String(url);
@@ -187,6 +191,18 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
                 {
                   name: 'models/text-embedding-004',
                   supportedGenerationMethods: ['embedContent'],
+                },
+                {
+                  name: 'models/gemini-2.5-flash-image',
+                  supportedGenerationMethods: ['generateContent'],
+                },
+                {
+                  name: 'models/gemini-2.5-flash-native-audio-latest',
+                  supportedGenerationMethods: ['generateContent'],
+                },
+                {
+                  name: 'models/gemini-robotics-er-1.5-preview',
+                  supportedGenerationMethods: ['generateContent'],
                 },
                 {
                   name: 'models/gemini-2.5-flash-tts',
@@ -243,8 +259,79 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
         expect(calledUrls[3]).toContain(
           'gemini-3.0-flash-preview:generateContent'
         );
+        expect(
+          calledUrls.some((u) => u.includes('gemini-2.5-flash-image'))
+        ).toBe(false);
         expect(res.dice).toEqual([5, 3]);
         expect(res.detectedTurn).toBe('black');
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('retries the same model without thinkingConfig when HTTP 400 mentions thinkingBudget', async () => {
+      const requestBodies: Array<Record<string, unknown>> = [];
+      let callCount = 0;
+
+      const mockFetch = vi.fn(
+        async (_url: string | URL | Request, init?: RequestInit) => {
+          callCount += 1;
+          if (typeof init?.body === 'string') {
+            requestBodies.push(JSON.parse(init.body));
+          }
+
+          if (callCount === 1) {
+            return new Response(
+              JSON.stringify({
+                error: { message: 'thinkingBudget is not supported by model' },
+              }),
+              { status: 400 }
+            );
+          }
+
+          return new Response(
+            JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        text: JSON.stringify({
+                          points: createInitialBoard().points,
+                          bar: { white: 0, black: 0 },
+                          borneOff: { white: 0, black: 0 },
+                          dice: [4, 2],
+                          detectedTurn: 'white',
+                          notes: 'הצליח ללא thinkingConfig',
+                        }),
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+      );
+
+      vi.stubGlobal('fetch', mockFetch);
+      try {
+        const res = await scanBackgammonImage(
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+          'AIzaTestKey123'
+        );
+
+        expect(callCount).toBe(2);
+        expect(
+          (requestBodies[0].generationConfig as Record<string, unknown>)
+            .thinkingConfig
+        ).toBeDefined();
+        expect(
+          (requestBodies[1].generationConfig as Record<string, unknown>)
+            .thinkingConfig
+        ).toBeUndefined();
+        expect(res.dice).toEqual([4, 2]);
       } finally {
         vi.unstubAllGlobals();
       }
@@ -253,7 +340,7 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
     it('aggregates errors across all attempted models so 429 quota is not masked behind a 404', async () => {
       const mockFetch = vi.fn(async (url: string | URL | Request) => {
         const urlStr = String(url);
-        if (urlStr.includes('gemini-2.5-flash:')) {
+        if (urlStr.includes('gemini-flash-lite-latest:')) {
           return new Response('Quota exceeded', { status: 429 });
         }
         return new Response('Model not found', { status: 404 });

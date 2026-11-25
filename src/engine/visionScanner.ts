@@ -356,13 +356,30 @@ export function swapBoardColors(state: BoardState): BoardState {
 }
 
 export const GEMINI_VISION_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.5-flash-lite',
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
 ] as const;
 
-export const GEMINI_REQUEST_TIMEOUT_MS = 20000;
+export const GEMINI_REQUEST_TIMEOUT_MS = 90000;
 
+const WORKING_MODEL_SESSION_KEY = 'gemini_vision_working_model';
 const RETRYABLE_HTTP_STATUSES = new Set([404, 429, 503]);
+
+const EXCLUDED_DISCOVERY_TERMS = [
+  '-image',
+  'imagen',
+  '-tts',
+  '-audio',
+  'native-audio',
+  'embedding',
+  'live',
+  'veo',
+  'lyria',
+  'robotics',
+  'computer-use',
+  'deep-research',
+  'aqa',
+];
 
 export class ScanCancelledError extends Error {
   constructor() {
@@ -371,10 +388,37 @@ export class ScanCancelledError extends Error {
   }
 }
 
+function getCachedWorkingModel(): string | null {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      const val = sessionStorage.getItem(WORKING_MODEL_SESSION_KEY);
+      return val && val.trim().length > 0 ? val.trim() : null;
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+  return null;
+}
+
+function setCachedWorkingModel(modelName: string): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.setItem(WORKING_MODEL_SESSION_KEY, modelName);
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
+function shouldApplyThinkingConfig(modelName: string): boolean {
+  const lower = modelName.toLowerCase();
+  return lower.includes('flash') || lower.includes('latest');
+}
+
 function getThinkingBudgetForModel(modelName: string): number {
   const lower = modelName.toLowerCase();
   if (lower.includes('lite')) return 0;
-  return 1024;
+  return 512;
 }
 
 interface AttemptError {
@@ -391,11 +435,11 @@ interface DiscoveredModelEntry {
 function scoreDiscoveredModel(modelName: string): number {
   const lower = modelName.toLowerCase();
   let score = 0;
-  if (lower.includes('2.5')) score += 100;
-  else if (lower.includes('2.0')) score += 40;
-  if (lower.includes('flash') && !lower.includes('lite')) score += 30;
-  else if (lower.includes('pro')) score += 25;
-  else if (lower.includes('flash-lite') || lower.includes('lite')) score += 15;
+  if (lower.includes('latest')) score += 120;
+  if (lower.includes('flash-lite') || lower.includes('lite')) score += 60;
+  else if (lower.includes('flash')) score += 50;
+  else if (lower.includes('pro')) score += 20;
+  if (lower.includes('2.5')) score += 15;
   if (!lower.includes('exp') && !lower.includes('preview')) score += 5;
   return score;
 }
@@ -412,7 +456,6 @@ async function discoverActiveGeminiVisionModels(
 
   const json = (await res.json()) as { models?: DiscoveredModelEntry[] };
   const rawModels = Array.isArray(json.models) ? json.models : [];
-  const excludedTerms = ['embedding', 'tts', 'imagen', 'aqa', 'veo'];
 
   const candidates = rawModels
     .filter((entry) => {
@@ -421,27 +464,35 @@ async function discoverActiveGeminiVisionModels(
       const shortName = (entry.name ?? '').replace(/^models\//, '');
       const lower = shortName.toLowerCase();
       if (!lower.includes('gemini')) return false;
-      if (excludedTerms.some((term) => lower.includes(term))) return false;
+      if (EXCLUDED_DISCOVERY_TERMS.some((term) => lower.includes(term))) {
+        return false;
+      }
       if (alreadyTried.has(shortName)) return false;
       return shortName.length > 0;
     })
     .map((entry) => (entry.name ?? '').replace(/^models\//, ''))
     .filter((name) => {
       const lower = name.toLowerCase();
-      return lower.includes('flash') || lower.includes('pro');
+      return (
+        lower.includes('flash') ||
+        lower.includes('latest') ||
+        lower.includes('pro')
+      );
     });
 
   candidates.sort((a, b) => scoreDiscoveredModel(b) - scoreDiscoveredModel(a));
+  console.log('[VisionScanner] Eligible models:', candidates);
   return candidates.slice(0, 3);
 }
 
-async function invokeGeminiVisionModel(
+async function sendGeminiGenerateContentRequest(
   modelName: string,
   cleanKey: string,
   mimeType: string,
   data: string,
+  useThinkingConfig: boolean,
   externalSignal?: AbortSignal
-): Promise<ScannedBoardResponse> {
+): Promise<Response> {
   if (externalSignal?.aborted) {
     throw new ScanCancelledError();
   }
@@ -464,15 +515,14 @@ async function invokeGeminiVisionModel(
     temperature: 0.1,
     responseMimeType: 'application/json',
   };
-  if (modelName.includes('2.5')) {
+  if (useThinkingConfig && shouldApplyThinkingConfig(modelName)) {
     generationConfig.thinkingConfig = {
       thinkingBudget: getThinkingBudgetForModel(modelName),
     };
   }
 
-  let response: Response;
   try {
-    response = await fetch(endpoint, {
+    return await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -510,6 +560,45 @@ async function invokeGeminiVisionModel(
   } finally {
     clearTimeout(timeoutId);
     externalSignal?.removeEventListener('abort', onExternalAbort);
+  }
+}
+
+async function invokeGeminiVisionModel(
+  modelName: string,
+  cleanKey: string,
+  mimeType: string,
+  data: string,
+  externalSignal?: AbortSignal
+): Promise<ScannedBoardResponse> {
+  const applyThinking = shouldApplyThinkingConfig(modelName);
+  let response = await sendGeminiGenerateContentRequest(
+    modelName,
+    cleanKey,
+    mimeType,
+    data,
+    applyThinking,
+    externalSignal
+  );
+
+  // If a newer model rejects thinkingConfig with HTTP 400, retry once without thinkingConfig
+  if (!response.ok && response.status === 400 && applyThinking) {
+    const errBody = await response.text().catch(() => '');
+    if (/thinking/i.test(errBody)) {
+      response = await sendGeminiGenerateContentRequest(
+        modelName,
+        cleanKey,
+        mimeType,
+        data,
+        false,
+        externalSignal
+      );
+    } else {
+      const err = new Error(
+        `HTTP 400${errBody ? `: ${errBody.slice(0, 140)}` : ''}`
+      ) as Error & { status?: number };
+      err.status = 400;
+      throw err;
+    }
   }
 
   if (!response.ok) {
@@ -579,7 +668,15 @@ function buildAggregatedVisionError(attemptErrors: AttemptError[]): Error {
     );
   }
 
+  const hasTimeoutError = attemptErrors.some((e) => e.status === 504);
   const hasQuotaError = attemptErrors.some((e) => e.status === 429);
+
+  if (hasTimeoutError) {
+    return new Error(
+      `זמן ההמתנה לסריקת התמונה הסתיים (Timeout). נסה שוב או ערוך את הלוח ידנית. פירוט: ${summary}`
+    );
+  }
+
   if (hasQuotaError) {
     return new Error(
       `חריגה ממכסת הבקשות של Gemini API (429). המתן מספר שניות ונסה שוב, או ערוך את הלוח ידנית. פירוט: ${summary}`
@@ -599,9 +696,10 @@ function buildAggregatedVisionError(attemptErrors: AttemptError[]): Error {
 }
 
 /**
- * Calls Google Gemini Vision REST API with a fast capped-thinking fallback cascade
- * (`gemini-2.5-flash` [budget 1024] -> `gemini-2.5-flash-lite` [budget 0]) with a 20s per-model timeout,
- * plus automatic Dynamic Model Discovery via `GET /v1beta/models` if all static models return 404.
+ * Calls Google Gemini Vision REST API with active multimodal aliases
+ * (`gemini-flash-lite-latest` [budget 0] -> `gemini-flash-latest` [budget 512]) with a 35s per-model timeout,
+ * sessionStorage caching of the last working model, 400 thinking-config retry,
+ * and strict Dynamic Model Discovery via `GET /v1beta/models` if static models return 404.
  */
 export async function scanBackgammonImage(
   base64DataUrl: string,
@@ -629,21 +727,31 @@ export async function scanBackgammonImage(
   const attemptErrors: AttemptError[] = [];
   const triedModels = new Set<string>();
 
-  for (let i = 0; i < GEMINI_VISION_MODELS.length; i++) {
+  const cachedModel = getCachedWorkingModel();
+  const orderedStaticModels: string[] = cachedModel
+    ? [
+        cachedModel,
+        ...GEMINI_VISION_MODELS.filter((m) => m !== cachedModel),
+      ]
+    : [...GEMINI_VISION_MODELS];
+
+  for (let i = 0; i < orderedStaticModels.length; i++) {
     if (signal?.aborted) {
       throw new ScanCancelledError();
     }
-    const modelName = GEMINI_VISION_MODELS[i];
+    const modelName = orderedStaticModels[i];
     triedModels.add(modelName);
 
     try {
-      return await invokeGeminiVisionModel(
+      const result = await invokeGeminiVisionModel(
         modelName,
         cleanKey,
         mimeType,
         data,
         signal
       );
+      setCachedWorkingModel(modelName);
+      return result;
     } catch (err) {
       if (err instanceof ScanCancelledError || signal?.aborted) {
         throw new ScanCancelledError();
@@ -669,7 +777,7 @@ export async function scanBackgammonImage(
 
   // Dynamic Model Discovery fallback: if all static models returned 404, query active models list
   const allStatic404 =
-    attemptErrors.length === GEMINI_VISION_MODELS.length &&
+    attemptErrors.length === orderedStaticModels.length &&
     attemptErrors.every((e) => e.status === 404);
 
   if (allStatic404 && !signal?.aborted) {
@@ -684,13 +792,15 @@ export async function scanBackgammonImage(
         }
         triedModels.add(dynamicModel);
         try {
-          return await invokeGeminiVisionModel(
+          const result = await invokeGeminiVisionModel(
             dynamicModel,
             cleanKey,
             mimeType,
             data,
             signal
           );
+          setCachedWorkingModel(dynamicModel);
+          return result;
         } catch (err) {
           if (err instanceof ScanCancelledError || signal?.aborted) {
             throw new ScanCancelledError();
