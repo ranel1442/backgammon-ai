@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -22,6 +22,7 @@ export type { MoveClassification };
 
 export interface HistoryEntry {
   id: number;
+  turnId?: string;
   turnNumber: number;
   player: Player;
   dice: [number, number];
@@ -30,8 +31,10 @@ export interface HistoryEntry {
   turnStartState: BoardState;
   resultingState: BoardState;
   evalResult: EvalResult;
+  isAnalyzing?: boolean;
   classification?: MoveClassification;
   equityLoss?: number;
+  playedEvaluation?: TurnAnalysisResult['playedMoveAnalysis'];
   analysis?: TurnAnalysisResult;
 }
 
@@ -57,6 +60,32 @@ export const MoveHistory: React.FC<MoveHistoryProps> = ({
   onEnterSandboxAtTurn,
 }) => {
   const isViewingHistory = viewingIndex !== null;
+  const listContainerRef = useRef<HTMLDivElement | null>(null);
+  const prevHistoryLengthRef = useRef<number>(history.length);
+
+  // Reverse chronological display order (newest turn at top: N, N-1, ..., 1)
+  // while preserving original 0..N-1 `originalIndex` and `entry.turnNumber` bindings
+  const reversedHistory = useMemo(
+    () =>
+      history
+        .map((entry, originalIndex) => ({ entry, originalIndex }))
+        .reverse(),
+    [history]
+  );
+
+  useEffect(() => {
+    if (history.length > prevHistoryLengthRef.current && viewingIndex === null) {
+      const container = listContainerRef.current;
+      if (container) {
+        if (typeof container.scrollTo === 'function') {
+          container.scrollTo({ top: 0, behavior: 'smooth' });
+        } else {
+          container.scrollTop = 0;
+        }
+      }
+    }
+    prevHistoryLengthRef.current = history.length;
+  }, [history.length, viewingIndex]);
 
   return (
     <aside
@@ -81,7 +110,8 @@ export const MoveHistory: React.FC<MoveHistoryProps> = ({
         <div className="px-3 py-2.5 bg-amber-500/15 border-b border-amber-500/30 flex flex-col gap-2">
           <div className="flex items-center justify-between gap-2">
             <div className="text-xs text-amber-200 font-medium">
-              צופה בעמדה היסטורית (תור #{viewingIndex + 1})
+              צופה בעמדה היסטורית (תור #
+              {history[viewingIndex]?.turnNumber ?? viewingIndex + 1})
             </div>
             <button
               type="button"
@@ -105,8 +135,11 @@ export const MoveHistory: React.FC<MoveHistoryProps> = ({
         </div>
       )}
 
-      {/* Move List */}
-      <div className="flex-1 overflow-y-auto divide-y divide-slate-800/60 p-2 space-y-1">
+      {/* Move List (Newest Turn First) */}
+      <div
+        ref={listContainerRef}
+        className="flex-1 overflow-y-auto divide-y divide-slate-800/60 p-2 space-y-1"
+      >
         {history.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-500">
             <History className="w-8 h-8 mb-2 opacity-40" />
@@ -118,8 +151,8 @@ export const MoveHistory: React.FC<MoveHistoryProps> = ({
             </p>
           </div>
         ) : (
-          history.map((entry, idx) => {
-            const isSelected = viewingIndex === idx;
+          reversedHistory.map(({ entry, originalIndex }) => {
+            const isSelected = viewingIndex === originalIndex;
             const isWhite = entry.player === 'white';
             const meta = entry.classification
               ? getClassificationMeta(entry.classification)
@@ -137,10 +170,10 @@ export const MoveHistory: React.FC<MoveHistoryProps> = ({
 
             return (
               <button
-                key={entry.id}
+                key={entry.turnId ?? entry.id}
                 type="button"
                 onClick={() =>
-                  onSelectHistoryIndex(isSelected ? null : idx)
+                  onSelectHistoryIndex(isSelected ? null : originalIndex)
                 }
                 className={`w-full text-right px-3 py-2 rounded-xl transition-all flex items-center justify-between gap-2 cursor-pointer border ${
                   isSelected
@@ -152,7 +185,7 @@ export const MoveHistory: React.FC<MoveHistoryProps> = ({
                   {/* Turn Number & Player Disc */}
                   <span
                     dir="ltr"
-                    className="inline-block text-xs font-mono text-slate-500 w-5 shrink-0"
+                    className="inline-block text-xs font-mono text-slate-500 min-w-[1.5rem] shrink-0"
                   >
                     {entry.turnNumber}.
                   </span>
@@ -176,7 +209,7 @@ export const MoveHistory: React.FC<MoveHistoryProps> = ({
 
                 {/* AI Classification Badge + Equity Loss + Eval */}
                 <div className="flex items-center gap-1.5 shrink-0">
-                  {meta && entry.classification ? (
+                  {!entry.isAnalyzing && meta && entry.classification ? (
                     <span
                       className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-semibold border ${meta.bgClass} ${meta.textClass} ${meta.borderClass}`}
                     >
@@ -192,9 +225,9 @@ export const MoveHistory: React.FC<MoveHistoryProps> = ({
                       )}
                     </span>
                   ) : (
-                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-mono text-slate-400 bg-slate-800/60 border border-slate-700/50">
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 animate-pulse">
                       <Loader2 className="w-2.5 h-2.5 animate-spin text-cyan-400" />
-                      AI
+                      <span>מנתח ברקע...</span>
                     </span>
                   )}
 

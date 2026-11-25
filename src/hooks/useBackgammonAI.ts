@@ -1,10 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   analyzePosition,
+  BACKGROUND_ANALYSIS_CUTOFF_MS,
+  CHAMPION_SEARCH_DEPTH,
+  LIVE_SEARCH_CUTOFF_MS,
   type SearchDepth,
   type TurnAnalysisResult,
 } from '../engine/ai';
-import { tryLoadNeuralNetWeights } from '../engine/neuralNet';
+import {
+  fetchNeuralNetWeightsJSON,
+  initNeuralNetFromWeightsJSON,
+} from '../engine/neuralNet';
 import {
   runMonteCarloRollout,
   type RolloutMoveResult,
@@ -15,28 +21,54 @@ import type {
   AIWorkerResponse,
 } from '../workers/ai.worker';
 
-interface PendingAnalyzeCallback {
+interface PendingGameplayAnalyze {
+  state: BoardState;
+  dice: [number, number];
+  playedSteps?: MoveStep[];
   resolve: (result: TurnAnalysisResult) => void;
-  isLiveRequest: boolean;
 }
 
 interface PendingRolloutCallback {
   resolve: (results: RolloutMoveResult[]) => void;
 }
 
+interface QueuedTurnAnalysisItem {
+  turnId: string;
+  beforeState: BoardState;
+  dice: [number, number];
+  playedMove: MoveStep[];
+  generation: number;
+  onComplete?: (turnId: string, result: TurnAnalysisResult) => void;
+  resolve: (result: TurnAnalysisResult | null) => void;
+}
+
 export function useBackgammonAI() {
-  const workerRef = useRef<Worker | null>(null);
+  const gameplayWorkerRef = useRef<Worker | null>(null);
+  const analysisWorkerRef = useRef<Worker | null>(null);
+  const weightsReadyPromiseRef = useRef<Promise<void>>(Promise.resolve());
+
   const requestCounterRef = useRef(0);
-  const latestLiveRequestIdRef = useRef(0);
+  const latestGameplayRequestIdRef = useRef(0);
   const latestRolloutRequestIdRef = useRef(0);
-  const pendingMapRef = useRef<Map<number, PendingAnalyzeCallback>>(new Map());
+
+  const pendingGameplayMapRef = useRef<Map<number, PendingGameplayAnalyze>>(
+    new Map()
+  );
   const pendingRolloutRef = useRef<Map<number, PendingRolloutCallback>>(
     new Map()
   );
 
+  // Dedicated FIFO queue state for `analysisWorker`
+  const analysisQueueRef = useRef<QueuedTurnAnalysisItem[]>([]);
+  const activeAnalysisItemRef = useRef<{
+    requestId: number;
+    item: QueuedTurnAnalysisItem;
+  } | null>(null);
+  const queueGenerationRef = useRef(0);
+
   const [isThinking, setIsThinking] = useState(false);
-  const [thinkingDepth, setThinkingDepth] = useState<SearchDepth>(2);
   const [thinkingElapsedMs, setThinkingElapsedMs] = useState(0);
+  const [pendingAnalysisCount, setPendingAnalysisCount] = useState(0);
   const [isRollingOut, setIsRollingOut] = useState(false);
   const [rolloutProgress, setRolloutProgress] = useState(0);
   const [rolloutResults, setRolloutResults] = useState<
@@ -44,78 +76,288 @@ export function useBackgammonAI() {
   >(null);
   const [nnLoaded, setNnLoaded] = useState(false);
 
+  const syncPendingCount = useCallback(() => {
+    const count =
+      analysisQueueRef.current.length +
+      (activeAnalysisItemRef.current ? 1 : 0);
+    setPendingAnalysisCount(count);
+  }, []);
+
+  const pumpAnalysisQueue = useCallback(() => {
+    if (activeAnalysisItemRef.current !== null) {
+      return;
+    }
+
+    const nextItem = analysisQueueRef.current.shift();
+    if (!nextItem) {
+      setPendingAnalysisCount(0);
+      return;
+    }
+
+    // Skip stale items from a cleared game session
+    if (nextItem.generation !== queueGenerationRef.current) {
+      nextItem.resolve(null);
+      pumpAnalysisQueue();
+      return;
+    }
+
+    const worker = analysisWorkerRef.current;
+    if (!worker) {
+      // Fallback for non-Worker test environments (SSR / Vitest)
+      const syncRes = analyzePosition(
+        nextItem.beforeState,
+        nextItem.dice,
+        CHAMPION_SEARCH_DEPTH,
+        nextItem.playedMove,
+        BACKGROUND_ANALYSIS_CUTOFF_MS
+      );
+      if (nextItem.generation === queueGenerationRef.current) {
+        nextItem.onComplete?.(nextItem.turnId, syncRes);
+        nextItem.resolve(syncRes);
+      } else {
+        nextItem.resolve(null);
+      }
+      syncPendingCount();
+      pumpAnalysisQueue();
+      return;
+    }
+
+    const requestId = ++requestCounterRef.current;
+    activeAnalysisItemRef.current = { requestId, item: nextItem };
+    syncPendingCount();
+
+    void weightsReadyPromiseRef.current.then(() => {
+      if (
+        !analysisWorkerRef.current ||
+        activeAnalysisItemRef.current?.requestId !== requestId
+      ) {
+        return;
+      }
+      const payload: AIWorkerRequest = {
+        requestId,
+        type: 'ANALYZE',
+        state: nextItem.beforeState,
+        dice: nextItem.dice,
+        depth: CHAMPION_SEARCH_DEPTH,
+        playedSteps: nextItem.playedMove,
+        cutoffMs: BACKGROUND_ANALYSIS_CUTOFF_MS,
+        turnId: nextItem.turnId,
+      };
+      analysisWorkerRef.current.postMessage(payload);
+    });
+  }, [syncPendingCount]);
+
   useEffect(() => {
-    void tryLoadNeuralNetWeights('/weights/backgammon_nn.json').then(
-      (loaded) => {
-        if (loaded) setNnLoaded(true);
-      }
-    );
+    let disposed = false;
 
-    if (typeof Worker === 'undefined') return;
+    const hasWorkerSupport = typeof Worker !== 'undefined';
+    const gameplayWorker = hasWorkerSupport
+      ? new Worker(new URL('../workers/ai.worker.ts', import.meta.url), {
+          type: 'module',
+          name: 'backgammon-gameplay-worker',
+        })
+      : null;
 
-    const worker = new Worker(
-      new URL('../workers/ai.worker.ts', import.meta.url),
-      { type: 'module' }
-    );
+    const analysisWorker = hasWorkerSupport
+      ? new Worker(new URL('../workers/ai.worker.ts', import.meta.url), {
+          type: 'module',
+          name: 'backgammon-analysis-worker',
+        })
+      : null;
 
-    worker.onmessage = (event: MessageEvent<AIWorkerResponse>) => {
-      const msg = event.data;
+    gameplayWorkerRef.current = gameplayWorker;
+    analysisWorkerRef.current = analysisWorker;
 
-      if (msg.type === 'ANALYZE_RESULT') {
-        const { requestId, result } = msg;
-        const pending = pendingMapRef.current.get(requestId);
-        if (!pending) return;
+    // Fetch `/weights/backgammon_nn.json` ONCE on the main thread and broadcast to both workers
+    weightsReadyPromiseRef.current = fetchNeuralNetWeightsJSON(
+      '/weights/backgammon_nn.json'
+    )
+      .then((weightsJson) => {
+        if (disposed) return;
+        const nn = initNeuralNetFromWeightsJSON(weightsJson);
+        if (nn) {
+          setNnLoaded(true);
+        }
+        const initMsg: AIWorkerRequest = {
+          type: 'INIT_WEIGHTS',
+          weights: weightsJson,
+        };
+        gameplayWorker?.postMessage(initMsg);
+        analysisWorker?.postMessage(initMsg);
+      })
+      .catch(() => {
+        // Fallback to hybrid heuristic + 54,264-state bear-off tablebase
+      });
 
-        pendingMapRef.current.delete(requestId);
-
-        if (
-          pending.isLiveRequest &&
-          requestId === latestLiveRequestIdRef.current
-        ) {
-          setIsThinking(false);
+    if (gameplayWorker) {
+      const failGameplayRequest = (errText: string, reqId?: number) => {
+        console.error('[useBackgammonAI] gameplayWorker error:', errText);
+        if (reqId !== undefined) {
+          const pending = pendingGameplayMapRef.current.get(reqId);
+          if (pending) {
+            pendingGameplayMapRef.current.delete(reqId);
+            if (reqId === latestGameplayRequestIdRef.current) {
+              setIsThinking(false);
+            }
+            const fallback = analyzePosition(
+              pending.state,
+              pending.dice,
+              1,
+              pending.playedSteps,
+              2000
+            );
+            pending.resolve(fallback);
+          }
+          const pendingRollout = pendingRolloutRef.current.get(reqId);
+          if (pendingRollout) {
+            pendingRolloutRef.current.delete(reqId);
+            if (reqId === latestRolloutRequestIdRef.current) {
+              setIsRollingOut(false);
+            }
+            pendingRollout.resolve([]);
+          }
+          return;
         }
 
-        if (
-          !pending.isLiveRequest ||
-          requestId === latestLiveRequestIdRef.current
-        ) {
+        // Unscoped worker error: drain all in-flight gameplay requests safely so timer never freezes
+        setIsThinking(false);
+        setIsRollingOut(false);
+        for (const [, pending] of pendingGameplayMapRef.current) {
+          const fallback = analyzePosition(
+            pending.state,
+            pending.dice,
+            1,
+            pending.playedSteps,
+            2000
+          );
+          pending.resolve(fallback);
+        }
+        pendingGameplayMapRef.current.clear();
+        for (const [, pendingR] of pendingRolloutRef.current) {
+          pendingR.resolve([]);
+        }
+        pendingRolloutRef.current.clear();
+      };
+
+      gameplayWorker.onerror = (ev) => {
+        failGameplayRequest(ev.message || 'Gameplay worker crashed');
+      };
+
+      gameplayWorker.onmessage = (event: MessageEvent<AIWorkerResponse>) => {
+        const msg = event.data;
+
+        if (msg.type === 'WORKER_ERROR') {
+          failGameplayRequest(msg.error, msg.requestId);
+          return;
+        }
+
+        if (msg.type === 'ANALYZE_RESULT') {
+          const { requestId, result } = msg;
+          const pending = pendingGameplayMapRef.current.get(requestId);
+          if (!pending) return;
+
+          pendingGameplayMapRef.current.delete(requestId);
+          if (requestId === latestGameplayRequestIdRef.current) {
+            setIsThinking(false);
+          }
           pending.resolve(result);
+          return;
         }
-        return;
-      }
 
-      if (msg.type === 'ROLLOUT_PROGRESS') {
-        if (msg.requestId === latestRolloutRequestIdRef.current) {
-          setRolloutProgress(msg.progressPct);
-          setRolloutResults(msg.partialResults);
+        if (msg.type === 'ROLLOUT_PROGRESS') {
+          if (msg.requestId === latestRolloutRequestIdRef.current) {
+            setRolloutProgress(msg.progressPct);
+            setRolloutResults(msg.partialResults);
+          }
+          return;
         }
-        return;
-      }
 
-      if (msg.type === 'ROLLOUT_RESULT') {
-        const pendingRollout = pendingRolloutRef.current.get(msg.requestId);
-        pendingRolloutRef.current.delete(msg.requestId);
+        if (msg.type === 'ROLLOUT_RESULT') {
+          const pendingRollout = pendingRolloutRef.current.get(msg.requestId);
+          pendingRolloutRef.current.delete(msg.requestId);
 
-        if (msg.requestId === latestRolloutRequestIdRef.current) {
-          setIsRollingOut(false);
-          setRolloutProgress(100);
-          setRolloutResults(msg.rolloutResults);
+          if (msg.requestId === latestRolloutRequestIdRef.current) {
+            setIsRollingOut(false);
+            setRolloutProgress(100);
+            setRolloutResults(msg.rolloutResults);
+          }
+          if (pendingRollout) {
+            pendingRollout.resolve(msg.rolloutResults);
+          }
         }
-        if (pendingRollout) {
-          pendingRollout.resolve(msg.rolloutResults);
-        }
-      }
-    };
+      };
+    }
 
-    workerRef.current = worker;
+    if (analysisWorker) {
+      const failActiveAnalysis = (errText: string, reqId?: number) => {
+        console.error('[useBackgammonAI] analysisWorker error:', errText);
+        const active = activeAnalysisItemRef.current;
+        if (!active) return;
+        if (reqId !== undefined && active.requestId !== reqId) return;
+
+        activeAnalysisItemRef.current = null;
+        const { item } = active;
+        if (item.generation === queueGenerationRef.current) {
+          const fallback = analyzePosition(
+            item.beforeState,
+            item.dice,
+            1,
+            item.playedMove,
+            2000
+          );
+          item.onComplete?.(item.turnId, fallback);
+          item.resolve(fallback);
+        } else {
+          item.resolve(null);
+        }
+        syncPendingCount();
+        pumpAnalysisQueue();
+      };
+
+      analysisWorker.onerror = (ev) => {
+        failActiveAnalysis(ev.message || 'Analysis worker crashed');
+      };
+
+      analysisWorker.onmessage = (event: MessageEvent<AIWorkerResponse>) => {
+        const msg = event.data;
+        if (msg.type === 'WORKER_ERROR') {
+          failActiveAnalysis(msg.error, msg.requestId);
+          return;
+        }
+        if (msg.type !== 'ANALYZE_RESULT') return;
+
+        const active = activeAnalysisItemRef.current;
+        if (!active || active.requestId !== msg.requestId) {
+          return;
+        }
+
+        activeAnalysisItemRef.current = null;
+        const { item } = active;
+
+        if (item.generation === queueGenerationRef.current) {
+          item.onComplete?.(item.turnId, msg.result);
+          item.resolve(msg.result);
+        } else {
+          item.resolve(null);
+        }
+
+        syncPendingCount();
+        pumpAnalysisQueue();
+      };
+    }
 
     return () => {
-      worker.terminate();
-      workerRef.current = null;
-      pendingMapRef.current.clear();
+      disposed = true;
+      gameplayWorker?.terminate();
+      analysisWorker?.terminate();
+      gameplayWorkerRef.current = null;
+      analysisWorkerRef.current = null;
+      pendingGameplayMapRef.current.clear();
       pendingRolloutRef.current.clear();
+      analysisQueueRef.current = [];
+      activeAnalysisItemRef.current = null;
     };
-  }, []);
+  }, [pumpAnalysisQueue, syncPendingCount]);
 
   useEffect(() => {
     if (!isThinking) {
@@ -129,46 +371,137 @@ export function useBackgammonAI() {
     return () => window.clearInterval(timer);
   }, [isThinking]);
 
-  const analyzeTurn = useCallback(
+  const dispatchGameplayAnalyze = useCallback(
     (
       state: BoardState,
       dice: [number, number],
-      depth: SearchDepth = 2,
-      playedSteps?: MoveStep[],
-      options?: { isBackground?: boolean }
+      playedSteps?: MoveStep[]
     ): Promise<TurnAnalysisResult> => {
       const requestId = ++requestCounterRef.current;
-      const isLiveRequest = !options?.isBackground;
+      latestGameplayRequestIdRef.current = requestId;
+      setIsThinking(true);
 
-      if (isLiveRequest) {
-        latestLiveRequestIdRef.current = requestId;
-        setThinkingDepth(depth);
-        setIsThinking(true);
-      }
-
-      if (!workerRef.current) {
-        const syncResult = analyzePosition(state, dice, depth, playedSteps);
-        if (isLiveRequest) {
-          setIsThinking(false);
-        }
+      if (!gameplayWorkerRef.current) {
+        const syncResult = analyzePosition(
+          state,
+          dice,
+          CHAMPION_SEARCH_DEPTH,
+          playedSteps,
+          LIVE_SEARCH_CUTOFF_MS
+        );
+        setIsThinking(false);
         return Promise.resolve(syncResult);
       }
 
       return new Promise<TurnAnalysisResult>((resolve) => {
-        pendingMapRef.current.set(requestId, { resolve, isLiveRequest });
-        const payload: AIWorkerRequest = {
-          requestId,
-          type: 'ANALYZE',
+        pendingGameplayMapRef.current.set(requestId, {
           state,
           dice,
-          depth,
           playedSteps,
-        };
-        workerRef.current!.postMessage(payload);
+          resolve,
+        });
+        void weightsReadyPromiseRef.current.then(() => {
+          if (!gameplayWorkerRef.current) {
+            const fallback = analyzePosition(
+              state,
+              dice,
+              CHAMPION_SEARCH_DEPTH,
+              playedSteps,
+              LIVE_SEARCH_CUTOFF_MS
+            );
+            setIsThinking(false);
+            resolve(fallback);
+            return;
+          }
+          const payload: AIWorkerRequest = {
+            requestId,
+            type: 'ANALYZE',
+            state,
+            dice,
+            depth: CHAMPION_SEARCH_DEPTH,
+            playedSteps,
+            cutoffMs: LIVE_SEARCH_CUTOFF_MS,
+          };
+          gameplayWorkerRef.current.postMessage(payload);
+        });
       });
     },
     []
   );
+
+  /**
+   * Computes the AI opponent's own move at Champion `Depth 3+` on the dedicated `gameplayWorker` thread.
+   */
+  const computeAIMove = useCallback(
+    (state: BoardState, dice: [number, number]): Promise<TurnAnalysisResult> =>
+      dispatchGameplayAnalyze(state, dice),
+    [dispatchGameplayAnalyze]
+  );
+
+  /**
+   * Computes on-demand Live Hint ("רמז חי"), Scanned Image, or Sandbox analysis at `Depth 3+` on `gameplayWorker`.
+   */
+  const analyzeLivePosition = useCallback(
+    (
+      state: BoardState,
+      dice: [number, number],
+      playedSteps?: MoveStep[]
+    ): Promise<TurnAnalysisResult> =>
+      dispatchGameplayAnalyze(state, dice, playedSteps),
+    [dispatchGameplayAnalyze]
+  );
+
+  /**
+   * Enqueues a completed turn into the dedicated background `analysisWorker` FIFO queue at `Depth 3+`.
+   * Never blocks `gameplayWorker` or delays the AI's dice roll / move execution.
+   */
+  const enqueueTurnAnalysis = useCallback(
+    (
+      turnId: string,
+      beforeState: BoardState,
+      dice: [number, number],
+      playedMove: MoveStep[],
+      onComplete?: (turnId: string, result: TurnAnalysisResult) => void
+    ): Promise<TurnAnalysisResult | null> => {
+      // Avoid duplicate queueing for the same turnId
+      const alreadyQueued =
+        activeAnalysisItemRef.current?.item.turnId === turnId ||
+        analysisQueueRef.current.some((q) => q.turnId === turnId);
+      if (alreadyQueued) {
+        return Promise.resolve(null);
+      }
+
+      const generation = queueGenerationRef.current;
+      return new Promise<TurnAnalysisResult | null>((resolve) => {
+        analysisQueueRef.current.push({
+          turnId,
+          beforeState,
+          dice,
+          playedMove,
+          generation,
+          onComplete,
+          resolve,
+        });
+        syncPendingCount();
+        pumpAnalysisQueue();
+      });
+    },
+    [pumpAnalysisQueue, syncPendingCount]
+  );
+
+  /**
+   * Clears all pending background analysis jobs (called on "משחק חדש" or loading a new position).
+   */
+  const clearAnalysisQueue = useCallback(() => {
+    queueGenerationRef.current += 1;
+    for (const queued of analysisQueueRef.current) {
+      queued.resolve(null);
+    }
+    analysisQueueRef.current = [];
+    latestGameplayRequestIdRef.current = ++requestCounterRef.current;
+    setIsThinking(false);
+    setPendingAnalysisCount(0);
+  }, []);
 
   const runRollout = useCallback(
     (
@@ -183,7 +516,7 @@ export function useBackgammonAI() {
       setRolloutProgress(0);
       setRolloutResults(null);
 
-      if (!workerRef.current) {
+      if (!gameplayWorkerRef.current) {
         const syncRollout = runMonteCarloRollout(
           state,
           dice,
@@ -202,15 +535,18 @@ export function useBackgammonAI() {
 
       return new Promise<RolloutMoveResult[]>((resolve) => {
         pendingRolloutRef.current.set(requestId, { resolve });
-        const payload: AIWorkerRequest = {
-          requestId,
-          type: 'ROLLOUT',
-          state,
-          dice,
-          candidateMoves,
-          trialsPerMove,
-        };
-        workerRef.current!.postMessage(payload);
+        void weightsReadyPromiseRef.current.then(() => {
+          if (!gameplayWorkerRef.current) return;
+          const payload: AIWorkerRequest = {
+            requestId,
+            type: 'ROLLOUT',
+            state,
+            dice,
+            candidateMoves,
+            trialsPerMove,
+          };
+          gameplayWorkerRef.current.postMessage(payload);
+        });
       });
     },
     []
@@ -223,11 +559,17 @@ export function useBackgammonAI() {
     setRolloutResults(null);
   }, []);
 
+  const thinkingDepth: SearchDepth = CHAMPION_SEARCH_DEPTH;
+
   return {
     isThinking,
     thinkingDepth,
     thinkingElapsedMs,
-    analyzeTurn,
+    computeAIMove,
+    analyzeLivePosition,
+    enqueueTurnAnalysis,
+    pendingAnalysisCount,
+    clearAnalysisQueue,
     isRollingOut,
     rolloutProgress,
     rolloutResults,

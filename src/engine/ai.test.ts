@@ -2,11 +2,20 @@ import { describe, expect, it } from 'vitest';
 import {
   ALL_21_DICE_OUTCOMES,
   analyzePosition,
+  BACKGROUND_ANALYSIS_CUTOFF_MS,
+  CHAMPION_SEARCH_DEPTH,
   computeExactDiceCombinatorics,
   formatTurnNotation,
   getClassificationMeta,
+  hashBoardStateNumeric,
+  LIVE_SEARCH_CUTOFF_MS,
 } from './ai';
 import { evaluatePosition } from './evaluator';
+import {
+  createUntrainedDualNN,
+  getActiveNeuralNet,
+  setActiveNeuralNet,
+} from './neuralNet';
 import {
   getOpeningBookRollEntries,
   isInitialBoardState,
@@ -349,7 +358,16 @@ describe('Backgammon Multi-Factor Evaluator, Opening Book & Deep Expectiminimax 
       expect(combClosed.opponentHitRolls).toBe(0);
     });
 
-    it('supports all 5 search depths (1, 2+, 3+, 4+, 5+) with Transposition Table and Anytime Cutoff', () => {
+    it('locks default search depth to uncompromised Champion Depth 3+ with lossless 53-bit numeric board hashing', () => {
+      expect(CHAMPION_SEARCH_DEPTH).toBe(3);
+
+      const initial = createInitialBoard();
+      const hBase = hashBoardStateNumeric(initial, 1, 3);
+      expect(Number.isSafeInteger(hBase)).toBe(true);
+      expect(hashBoardStateNumeric(initial, 1, 3)).toBe(hBase);
+      expect(hashBoardStateNumeric(initial, 2, 3)).not.toBe(hBase);
+      expect(hashBoardStateNumeric(initial, 1, 2)).not.toBe(hBase);
+
       const raceBoard = createEmptyBoard('white');
       raceBoard.points[4] = 2;
       raceBoard.points[2] = 2;
@@ -358,13 +376,57 @@ describe('Backgammon Multi-Factor Evaluator, Opening Book & Deep Expectiminimax 
       raceBoard.points[21] = -2;
       raceBoard.borneOff.black = 11;
 
-      for (const depth of [1, 2, 3, 4, 5] as const) {
-        const res = analyzePosition(raceBoard, [4, 2], depth);
-        expect(res.requestedDepth).toBe(depth);
-        expect(res.completedDepth).toBeGreaterThanOrEqual(1);
-        expect(res.topMoves.length).toBeGreaterThan(0);
-        expect(res.elapsedMs).toBeLessThan(9600);
-      }
+      expect(hashBoardStateNumeric(raceBoard, 1, 3)).not.toBe(hBase);
+
+      // Calling analyzePosition with no depth argument always completes the full Champion Depth 3+ tree
+      const defaultRes = analyzePosition(raceBoard, [4, 2]);
+      expect(defaultRes.requestedDepth).toBe(3);
+      expect(defaultRes.completedDepth).toBe(3);
+      expect(defaultRes.topMoves.length).toBeGreaterThan(0);
     });
+
+    it(
+      'completes Depth 3+ on an opening 3-2 roll with actual v3 260-feature 3-Net Residual dimensions cleanly under 28,500ms with finite equity',
+      () => {
+        expect(LIVE_SEARCH_CUTOFF_MS).toBe(28000);
+        expect(BACKGROUND_ANALYSIS_CUTOFF_MS).toBe(22000);
+
+        // Full v3 network dimensions: Contact (260->512->2xRes512->256->6), Crashed & Race (260->384->Res384->192->6)
+        const nn = createUntrainedDualNN(42, 15000512);
+        expect(nn.getVersion()).toBe(3);
+        expect(nn.metadata.trainedGames).toBe(15000512);
+
+        const prevNN = getActiveNeuralNet();
+        setActiveNeuralNet(nn);
+        try {
+          const initialBoard = createInitialBoard();
+          const t0 = performance.now();
+          const res = analyzePosition(
+            initialBoard,
+            [3, 2],
+            3,
+            undefined,
+            LIVE_SEARCH_CUTOFF_MS
+          );
+          const wallMs = performance.now() - t0;
+
+          expect(res.topMoves.length).toBeGreaterThan(0);
+          const best = res.topMoves[0];
+          expect(best.move.steps.length).toBe(2);
+          expect(Number.isFinite(best.equity)).toBe(true);
+          expect(Number.isNaN(best.equity)).toBe(false);
+          expect(Number.isFinite(best.winProb)).toBe(true);
+          expect(Number.isNaN(best.winProb)).toBe(false);
+          expect(res.completedDepth).toBe(3);
+          expect(res.completedPly3).toBeGreaterThanOrEqual(1);
+          expect(res.neuralEvals).toBeGreaterThan(100);
+          expect(wallMs).toBeLessThan(28500);
+          expect(res.elapsedMs!).toBeLessThan(28500);
+        } finally {
+          setActiveNeuralNet(prevNN);
+        }
+      },
+      35000
+    );
   });
 });

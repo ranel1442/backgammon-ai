@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   classifyGamePhase,
   createUntrainedDualNN,
+  DualBackgammonNN,
   extractFeatures210,
   extractFeatures260,
   FEATURE_VECTOR_SIZE,
   NN_INPUT_DIM,
   NN_INPUT_DIM_V2,
+  type ResidualBlockWeightsJSON,
 } from './neuralNet';
 import { runMonteCarloRollout } from './rollout';
 import { createInitialBoard, generateLegalTurnMoves } from './rules';
@@ -125,6 +127,181 @@ describe('260-Feature Grandmaster Extractor, 3-Network Residual NN (v3) & Rollou
       expect(r.ci95).toBeGreaterThanOrEqual(0);
       expect(r.winProb).toBeGreaterThanOrEqual(0);
       expect(r.winProb).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it('guarantees exact numerical parity (< 1e-5) between flattened zero-allocation Float32Array forward pass (j += 4 unrolled gemv) and naive 2D matrix multiplication', () => {
+    let prng = 1337;
+    const nextRand = (scale: number): number => {
+      prng = (Math.imul(prng, 1664525) + 1013904223) | 0;
+      return (((prng >>> 0) / 4294967296) - 0.5) * scale;
+    };
+
+    const make2DMatrix = (
+      outDim: number,
+      inDim: number,
+      scale: number
+    ): number[][] => {
+      const mat: number[][] = [];
+      for (let r = 0; r < outDim; r++) {
+        const row: number[] = [];
+        for (let c = 0; c < inDim; c++) {
+          row.push(nextRand(scale));
+        }
+        mat.push(row);
+      }
+      return mat;
+    };
+
+    const makeBias = (dim: number, scale = 0.05): number[] =>
+      Array.from({ length: dim }, () => nextRand(scale));
+
+    const naive2DLinear = (
+      w2d: number[][],
+      bias: number[],
+      x: number[],
+      applySiLU: boolean
+    ): number[] => {
+      const out = new Array<number>(w2d.length);
+      for (let o = 0; o < w2d.length; o++) {
+        let sum = bias[o];
+        const row = w2d[o];
+        for (let j = 0; j < row.length; j++) {
+          sum += row[j] * x[j];
+        }
+        out[o] = applySiLU ? sum / (1.0 + Math.exp(-sum)) : sum;
+      }
+      return out;
+    };
+
+    const build2DSubNetSpec = (
+      inDim: number,
+      resDim: number,
+      neckDim: number,
+      numBlocks: number
+    ) => {
+      const inW = make2DMatrix(resDim, inDim, Math.sqrt(2 / inDim) * 0.25);
+      const inB = makeBias(resDim);
+      const blocks: Array<{
+        dim: number;
+        w1: number[][];
+        b1: number[];
+        w2: number[][];
+        b2: number[];
+      }> = [];
+      for (let b = 0; b < numBlocks; b++) {
+        blocks.push({
+          dim: resDim,
+          w1: make2DMatrix(resDim, resDim, Math.sqrt(2 / resDim) * 0.2),
+          b1: makeBias(resDim),
+          w2: make2DMatrix(resDim, resDim, Math.sqrt(2 / resDim) * 0.2),
+          b2: makeBias(resDim),
+        });
+      }
+      const neckW = make2DMatrix(neckDim, resDim, Math.sqrt(2 / resDim) * 0.25);
+      const neckB = makeBias(neckDim);
+      const outW = make2DMatrix(6, neckDim, Math.sqrt(2 / neckDim) * 0.25);
+      const outB = makeBias(6);
+
+      const referenceForward = (featArray: Float32Array) => {
+        let x = naive2DLinear(inW, inB, Array.from(featArray), true);
+        for (const blk of blocks) {
+          const h1 = naive2DLinear(blk.w1, blk.b1, x, true);
+          const h2 = naive2DLinear(blk.w2, blk.b2, h1, true);
+          x = x.map((v, idx) => v + h2[idx]);
+        }
+        const neck = naive2DLinear(neckW, neckB, x, true);
+        const logits = naive2DLinear(outW, outB, neck, false);
+        const maxL = Math.max(...logits);
+        const exps = logits.map((l) => Math.exp(l - maxL));
+        const denom = exps.reduce((a, b) => a + b, 0);
+        const probs = exps.map((e) => e / denom);
+        const pWinGammon = probs[1] + probs[2];
+        const pLoseGammon = probs[4] + probs[5];
+        const winProb01 = probs[0] + pWinGammon;
+        const equity = Math.max(
+          -3.0,
+          Math.min(
+            3.0,
+            winProb01 -
+              (1 - winProb01) +
+              (pWinGammon - pLoseGammon) +
+              (probs[2] - probs[5])
+          )
+        );
+        return { probs, winProb01, equity };
+      };
+
+      const json = {
+        inDim,
+        resDim,
+        bottleneckDim: neckDim,
+        outDim: 6,
+        inW,
+        inB,
+        resBlocks: blocks as ResidualBlockWeightsJSON[],
+        neckW,
+        neckB,
+        outW,
+        outB,
+      };
+
+      return { json, referenceForward };
+    };
+
+    const contactSpec = build2DSubNetSpec(NN_INPUT_DIM, 512, 256, 2);
+    const crashedSpec = build2DSubNetSpec(NN_INPUT_DIM, 384, 192, 1);
+    const raceSpec = build2DSubNetSpec(NN_INPUT_DIM, 384, 192, 1);
+
+    // Load 2D weight matrices directly into DualBackgammonNN (flattened once at load time)
+    const compiledNN = new DualBackgammonNN({
+      version: 3,
+      trainedGames: 15000512,
+      contact: contactSpec.json,
+      crashed: crashedSpec.json,
+      race: raceSpec.json,
+    });
+
+    const boardA = createInitialBoard();
+    boardA.points[4] = 3;
+    boardA.points[9] = 1;
+    boardA.bar.black = 1;
+    boardA.points[23] = 1;
+
+    const boardB = createInitialBoard();
+    boardB.points.fill(0);
+    boardB.points[2] = 4;
+    boardB.points[5] = 3;
+    boardB.borneOff.white = 8;
+    boardB.points[19] = -4;
+    boardB.points[22] = -3;
+    boardB.borneOff.black = 8;
+
+    for (const board of [boardA, boardB, boardA]) {
+      for (const [phase, spec] of [
+        ['contact', contactSpec],
+        ['crashed', crashedSpec],
+        ['race', raceSpec],
+      ] as const) {
+        for (const perspective of ['white', 'black'] as const) {
+          const feats = extractFeatures260(board, perspective);
+          const ref = spec.referenceForward(feats);
+          const fast = compiledNN.forwardPerspective(board, perspective, phase);
+
+          expect(Math.abs(fast.winProb01 - ref.winProb01)).toBeLessThan(1e-5);
+          expect(Math.abs(fast.equity - ref.equity)).toBeLessThan(1e-5);
+          expect(Math.abs(fast.pWinSingle - ref.probs[0])).toBeLessThan(1e-5);
+          expect(Math.abs(fast.pWinGammonOnly - ref.probs[1])).toBeLessThan(
+            1e-5
+          );
+          expect(Math.abs(fast.pWinBg - ref.probs[2])).toBeLessThan(1e-5);
+          expect(Math.abs(fast.pLoseSingle - ref.probs[3])).toBeLessThan(1e-5);
+          expect(Math.abs(fast.pLoseGammonOnly - ref.probs[4])).toBeLessThan(
+            1e-5
+          );
+          expect(Math.abs(fast.pLoseBg - ref.probs[5])).toBeLessThan(1e-5);
+        }
+      }
     }
   });
 });

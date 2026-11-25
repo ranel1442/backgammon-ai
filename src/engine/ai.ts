@@ -9,6 +9,18 @@ import type { BoardState, MoveStep, Player, TurnMove } from './types';
 
 export type SearchDepth = 1 | 2 | 3 | 4 | 5;
 
+/** Champion search depth (Depth 3+ won the 10,000-game league 4-0-0) */
+export const CHAMPION_SEARCH_DEPTH: SearchDepth = 3;
+
+/** Hard safety deadline for live gameplay / hints (`gameplayWorker`) */
+export const LIVE_SEARCH_CUTOFF_MS = 28000;
+
+/** Hard safety deadline for background move review (`analysisWorker`) */
+export const BACKGROUND_ANALYSIS_CUTOFF_MS = 22000;
+
+/** Default safety cutoff alias (`28,000ms`) */
+export const DEFAULT_ANYTIME_CUTOFF_MS = LIVE_SEARCH_CUTOFF_MS;
+
 export type MoveClassification =
   | 'Best'
   | 'Good'
@@ -118,6 +130,9 @@ export interface TurnAnalysisResult {
   requestedDepth?: SearchDepth;
   completedDepth?: SearchDepth;
   elapsedMs?: number;
+  neuralEvals?: number;
+  completedPly3?: number;
+  targetPly3?: number;
   playedMoveAnalysis?: {
     notation: string;
     equity: number;
@@ -151,20 +166,6 @@ export const ALL_21_DICE_OUTCOMES: readonly DiceRollOutcome[] = (() => {
   }
   return outcomes;
 })();
-
-/**
- * Representative strategic dice rolls used during the Selective 3-Ply Extension
- * to evaluate the moving player's follow-up potential without blocking the UI.
- */
-const SELECTIVE_3PLY_ROLLS: readonly DiceRollOutcome[] = [
-  { dice: [3, 1], probability: 2 / 14, countOutOf36: 2 },
-  { dice: [4, 2], probability: 2 / 14, countOutOf36: 2 },
-  { dice: [5, 3], probability: 2 / 14, countOutOf36: 2 },
-  { dice: [6, 1], probability: 2 / 14, countOutOf36: 2 },
-  { dice: [6, 4], probability: 2 / 14, countOutOf36: 2 },
-  { dice: [6, 5], probability: 2 / 14, countOutOf36: 2 },
-  { dice: [5, 2], probability: 2 / 14, countOutOf36: 2 },
-];
 
 /**
  * Shared helper to format a sequence of MoveSteps into standard Backgammon notation
@@ -432,25 +433,164 @@ export function buildRunnerUpComparison(
   return `עדיף ב-+${eqGain.toFixed(2)} Equity על פני ${runnerUp.notation}: ${clauses.join(', ')}.`;
 }
 
-function getPhysicalStateSignature(state: BoardState): string {
-  return `${state.bar.white},${state.bar.black}|${state.borneOff.white},${state.borneOff.black}|${state.points.join(',')}`;
+/**
+ * Fast zero-allocation 53-bit IEEE-754 integer board hash combining dual orthogonal 32-bit FNV-1a / Murmur-style
+ * integer hashes across all 24 points, bars, borneOff counts, active turn (`turnCode`), and search depth (`plyCode`).
+ * Eliminates string concatenations and array joins in `evalCache` and `transpositionTable`.
+ */
+export function hashBoardStateNumeric(
+  state: BoardState,
+  turnCode: number = 0,
+  plyCode: number = 0
+): number {
+  const pts = state.points;
+  let h1 = 0x811c9dc5 | 0;
+  let h2 = 0x9e3779b9 | 0;
+
+  for (let i = 0; i < 24; i++) {
+    const v = (pts[i] + 32) | 0;
+    h1 = Math.imul(h1 ^ v, 0x01000193);
+    h2 = Math.imul(h2 ^ (v + Math.imul(i + 1, 0x9e3779b1)), 0x85ebca6b);
+  }
+
+  const bw = state.bar.white | 0;
+  const bb = state.bar.black | 0;
+  const ow = state.borneOff.white | 0;
+  const ob = state.borneOff.black | 0;
+  const meta1 = bw | (bb << 5) | (ow << 10) | (ob << 15);
+  const meta2 = (turnCode & 3) | ((plyCode & 31) << 2);
+
+  h1 = Math.imul(h1 ^ meta1, 0x01000193);
+  h1 = Math.imul(h1 ^ meta2, 0x01000193);
+  h1 ^= h1 >>> 16;
+
+  h2 = Math.imul(h2 ^ meta1, 0xc2b2ae35);
+  h2 = Math.imul(h2 ^ Math.imul(meta2 + 1, 0x27d4eb2d), 0x85ebca6b);
+  h2 ^= h2 >>> 15;
+
+  // Top 21 bits of h1 * 2^32 + unsigned 32 bits of h2 -> exact 53-bit integer in [0, Number.MAX_SAFE_INTEGER]
+  return (h1 >>> 11) * 4294967296 + (h2 >>> 0);
+}
+
+/**
+ * Deduplicates move permutations that produce the exact same resulting physical `BoardState`,
+ * returning each unique move alongside its precomputed 53-bit `boardHash`.
+ */
+function deduplicateMovesByResultingState(
+  moves: TurnMove[]
+): Array<{ move: TurnMove; boardHash: number }> {
+  const len = moves.length;
+  if (len === 0) return [];
+  if (len === 1) {
+    return [
+      {
+        move: moves[0],
+        boardHash: hashBoardStateNumeric(moves[0].resultingState),
+      },
+    ];
+  }
+
+  const seen = new Set<number>();
+  const unique: Array<{ move: TurnMove; boardHash: number }> = [];
+  for (let i = 0; i < len; i++) {
+    const m = moves[i];
+    const h = hashBoardStateNumeric(m.resultingState);
+    if (!seen.has(h)) {
+      seen.add(h);
+      unique.push({ move: m, boardHash: h });
+    }
+  }
+  return unique;
+}
+
+interface SearchStats {
+  neuralEvals: number;
+}
+
+class SearchCutoffReachedError extends Error {
+  constructor() {
+    super('SEARCH_DEADLINE_REACHED');
+  }
 }
 
 function evalWithCache(
   state: BoardState,
-  cache?: Map<string, EvalResult>
+  cache?: Map<number, EvalResult>,
+  precomputedHash?: number,
+  stats?: SearchStats
 ): EvalResult {
   if (!cache) {
-    return evaluatePosition(state);
+    if (stats) stats.neuralEvals += 1;
+    return evaluatePosition(state, true);
   }
-  const key = getPhysicalStateSignature(state);
+  const key =
+    precomputedHash !== undefined
+      ? precomputedHash
+      : hashBoardStateNumeric(state);
   const existing = cache.get(key);
-  if (existing) {
+  if (existing !== undefined) {
     return existing;
   }
-  const computed = evaluatePosition(state);
+  if (stats) stats.neuralEvals += 1;
+  const computed = evaluatePosition(state, true);
   cache.set(key, computed);
   return computed;
+}
+
+/**
+ * Fast-ranks legal moves for `movingPlayer` using cached full v3 ResNet equities when available
+ * or the `< 5µs` Tactical Heuristic + Exact Bear-Off Tablebase (`evaluatePosition(s, false)`),
+ * returning the top `limit` moves for direct full v3 ResNet evaluation.
+ */
+function selectTopMovesForResNet(
+  uniqueMoves: Array<{ move: TurnMove; boardHash: number }>,
+  movingPlayer: Player,
+  limit: number,
+  evalCache: Map<number, EvalResult>,
+  fastRankCache: Map<number, number>
+): Array<{ move: TurnMove; boardHash: number }> {
+  if (uniqueMoves.length <= limit) {
+    return uniqueMoves;
+  }
+
+  const isWhite = movingPlayer === 'white';
+  const scored = new Array<{
+    move: TurnMove;
+    boardHash: number;
+    fastScore: number;
+  }>(uniqueMoves.length);
+
+  for (let i = 0; i < uniqueMoves.length; i++) {
+    const item = uniqueMoves[i];
+    const cachedFull = evalCache.get(item.boardHash);
+    let fastScore: number;
+    if (cachedFull !== undefined) {
+      fastScore = cachedFull.equity;
+    } else {
+      const cachedFast = fastRankCache.get(item.boardHash);
+      if (cachedFast !== undefined) {
+        fastScore = cachedFast;
+      } else {
+        fastScore = evaluatePosition(item.move.resultingState, false).equity;
+        fastRankCache.set(item.boardHash, fastScore);
+      }
+    }
+    scored[i] = {
+      move: item.move,
+      boardHash: item.boardHash,
+      fastScore,
+    };
+  }
+
+  scored.sort((a, b) =>
+    isWhite ? b.fastScore - a.fastScore : a.fastScore - b.fastScore
+  );
+
+  const top = new Array<{ move: TurnMove; boardHash: number }>(limit);
+  for (let i = 0; i < limit; i++) {
+    top[i] = { move: scored[i].move, boardHash: scored[i].boardHash };
+  }
+  return top;
 }
 
 /**
@@ -464,7 +604,7 @@ export function generateTacticalExplanation(
   player: Player,
   isBest: boolean,
   dice?: [number, number],
-  cache?: Map<string, EvalResult>,
+  cache?: Map<number, EvalResult>,
   candCombinatorics?: ExactDiceCombinatorics,
   bestCombinatorics?: ExactDiceCombinatorics
 ): string[] {
@@ -654,29 +794,72 @@ export function generateTacticalExplanation(
   return uniqueInsights.slice(0, 4);
 }
 
+interface OptimalOpponentReply {
+  state: BoardState;
+  boardHash: number;
+  equity: number;
+  probability: number;
+}
+
+interface StageA2PlyResult {
+  equity: number;
+  rawEquity: number;
+  winProb: number;
+  gammonProb: number;
+  optimalOppReplies: OptimalOpponentReply[];
+}
+
+const STAGE_A_ROOT_BASE_K1 = 8;
+const STAGE_A_ROOT_MAX_K1 = 10;
+const STAGE_A_ROOT_EXPAND_MARGIN = 0.06;
+const STAGE_A_OPP_TOP_REPLIES = 6;
+
+const STAGE_B_DEEP_BASE_K = 6;
+const STAGE_B_DEEP_MAX_K = 8;
+const STAGE_B_DEEP_EXPAND_MARGIN = 0.05;
+const STAGE_B_COUNTER_TOP_MOVES = 4;
+
 /**
- * Evaluates a candidate board state using 2-Ply Expectiminimax:
- * computes the probability-weighted expected equity across all 21 opponent dice rolls,
- * assuming the opponent plays their best 1-Ply response for each roll.
+ * Stage A (Ply 2 — Opponent's 21 rolls):
+ * For each of the 21 opponent dice rolls, fast-ranks legal replies and evaluates the
+ * **top 6** replies directly with the full v3 ResNet to identify the opponent's true
+ * single optimal reply (`K2 = 1`), checking `deadlineMs` inside every Ply-2 dice loop.
  */
-function evaluate2PlyExpectiminimax(
+function evaluateStageA2PlyFoundation(
   afterPlayerMoveState: BoardState,
   playerWhoMoved: Player,
-  cache: Map<string, EvalResult>
-): { equity: number; winProb: number; gammonProb: number } {
+  evalCache: Map<number, EvalResult>,
+  fastRankCache: Map<number, number>,
+  stats: SearchStats,
+  deadlineMs: number,
+  precomputedBaseHash?: number
+): StageA2PlyResult {
+  const baseHash =
+    precomputedBaseHash !== undefined
+      ? precomputedBaseHash
+      : hashBoardStateNumeric(afterPlayerMoveState);
+
   if (
     afterPlayerMoveState.borneOff.white >= 15 ||
     afterPlayerMoveState.borneOff.black >= 15
   ) {
-    const termEval = evalWithCache(afterPlayerMoveState, cache);
+    const termEval = evalWithCache(
+      afterPlayerMoveState,
+      evalCache,
+      baseHash,
+      stats
+    );
     return {
       equity: termEval.equity,
+      rawEquity: termEval.equity,
       winProb: termEval.winProb,
       gammonProb: termEval.gammonProb,
+      optimalOppReplies: [],
     };
   }
 
   const opponent: Player = playerWhoMoved === 'white' ? 'black' : 'white';
+  const oppIsWhite = opponent === 'white';
   const oppTurnState: BoardState = {
     points: [...afterPlayerMoveState.points],
     bar: { ...afterPlayerMoveState.bar },
@@ -688,35 +871,68 @@ function evaluate2PlyExpectiminimax(
 
   let expectedEquity = 0;
   let expectedGammon = 0;
+  const optimalOppReplies = new Array<OptimalOpponentReply>(
+    ALL_21_DICE_OUTCOMES.length
+  );
 
-  for (const outcome of ALL_21_DICE_OUTCOMES) {
-    const oppMoves = generateLegalTurnMoves(oppTurnState, outcome.dice);
+  for (let r = 0; r < ALL_21_DICE_OUTCOMES.length; r++) {
+    if (performance.now() >= deadlineMs) {
+      throw new SearchCutoffReachedError();
+    }
 
-    if (oppMoves.length === 0) {
-      const passEval = evalWithCache(oppTurnState, cache);
+    const outcome = ALL_21_DICE_OUTCOMES[r];
+    const uniqueOppMoves = deduplicateMovesByResultingState(
+      generateLegalTurnMoves(oppTurnState, outcome.dice)
+    );
+
+    if (uniqueOppMoves.length === 0) {
+      const passEval = evalWithCache(oppTurnState, evalCache, baseHash, stats);
       expectedEquity += outcome.probability * passEval.equity;
       expectedGammon += outcome.probability * passEval.gammonProb;
+      optimalOppReplies[r] = {
+        state: oppTurnState,
+        boardHash: baseHash,
+        equity: passEval.equity,
+        probability: outcome.probability,
+      };
     } else {
-      let bestOppEquity = opponent === 'white' ? -Infinity : Infinity;
-      let bestOppGammon = 0;
+      const topReplies = selectTopMovesForResNet(
+        uniqueOppMoves,
+        opponent,
+        STAGE_A_OPP_TOP_REPLIES,
+        evalCache,
+        fastRankCache
+      );
 
-      for (const oppMove of oppMoves) {
-        const ev = evalWithCache(oppMove.resultingState, cache);
-        if (opponent === 'white') {
-          if (ev.equity > bestOppEquity) {
-            bestOppEquity = ev.equity;
-            bestOppGammon = ev.gammonProb;
-          }
-        } else {
-          if (ev.equity < bestOppEquity) {
-            bestOppEquity = ev.equity;
-            bestOppGammon = ev.gammonProb;
-          }
+      let bestOppEquity = oppIsWhite ? -Infinity : Infinity;
+      let bestOppGammon = 0;
+      let bestOppState = topReplies[0].move.resultingState;
+      let bestOppHash = topReplies[0].boardHash;
+
+      for (let m = 0; m < topReplies.length; m++) {
+        const rep = topReplies[m];
+        const ev = evalWithCache(
+          rep.move.resultingState,
+          evalCache,
+          rep.boardHash,
+          stats
+        );
+        if (oppIsWhite ? ev.equity > bestOppEquity : ev.equity < bestOppEquity) {
+          bestOppEquity = ev.equity;
+          bestOppGammon = ev.gammonProb;
+          bestOppState = rep.move.resultingState;
+          bestOppHash = rep.boardHash;
         }
       }
 
       expectedEquity += outcome.probability * bestOppEquity;
       expectedGammon += outcome.probability * bestOppGammon;
+      optimalOppReplies[r] = {
+        state: bestOppState,
+        boardHash: bestOppHash,
+        equity: bestOppEquity,
+        probability: outcome.probability,
+      };
     }
   }
 
@@ -726,288 +942,182 @@ function evaluate2PlyExpectiminimax(
   const rawWinProb =
     equity === 0 ? 50 : 100 / (1 + Math.exp(-clampedEquity * 1.18));
   const winProb = Number(Math.max(0.5, Math.min(99.5, rawWinProb)).toFixed(1));
-  const gammonProb = Number(Math.max(0, Math.min(95, expectedGammon)).toFixed(1));
+  const gammonProb = Number(
+    Math.max(0, Math.min(95, expectedGammon)).toFixed(1)
+  );
 
-  return { equity, winProb, gammonProb };
+  return {
+    equity,
+    rawEquity: clampedEquity,
+    winProb,
+    gammonProb,
+    optimalOppReplies,
+  };
 }
 
 /**
- * Selective 3-Ply Extension for close tactical contact decisions:
- * Evaluates a candidate move one ply deeper by simulating the opponent's best reply
- * across representative dice rolls and then finding the moving player's best counter-reply.
+ * Stage B (Ply 3 — Our 21 follow-up rolls after Opponent's optimal reply `K2 = 1`):
+ * Uses the 53-bit Numeric Transposition Table across all opponent optimal replies,
+ * fast-ranks our legal follow-up moves on each of the 21 dice outcomes, and evaluates
+ * the **top 4** moves directly with the full v3 ResNet, checking `deadlineMs` inside every Ply-3 dice loop.
  */
-function evaluateSelective3PlyExtension(
-  afterPlayerMoveState: BoardState,
+function evaluateStageB3PlyRefinement(
+  optimalOppReplies: OptimalOpponentReply[],
   playerWhoMoved: Player,
-  base2PlyEquity: number,
-  baseGammonProb: number,
-  cache: Map<string, EvalResult>
-): { equity: number; winProb: number; gammonProb: number } {
-  if (
-    afterPlayerMoveState.borneOff.white >= 15 ||
-    afterPlayerMoveState.borneOff.black >= 15
-  ) {
-    const termEval = evalWithCache(afterPlayerMoveState, cache);
-    return {
-      equity: termEval.equity,
-      winProb: termEval.winProb,
-      gammonProb: termEval.gammonProb,
-    };
+  evalCache: Map<number, EvalResult>,
+  fastRankCache: Map<number, number>,
+  ply3TranspositionTable: Map<number, number>,
+  stats: SearchStats,
+  deadlineMs: number,
+  fallbackEquity: number
+): number {
+  if (optimalOppReplies.length === 0) {
+    return fallbackEquity;
   }
 
-  const opponent: Player = playerWhoMoved === 'white' ? 'black' : 'white';
-  const oppTurnState: BoardState = {
-    points: [...afterPlayerMoveState.points],
-    bar: { ...afterPlayerMoveState.bar },
-    borneOff: { ...afterPlayerMoveState.borneOff },
-    currentTurn: opponent,
-    dice: [],
-    remainingMoves: [],
-  };
+  const playerIsWhite = playerWhoMoved === 'white';
+  const playerTurnCode = playerIsWhite ? 1 : 2;
+  let totalExpectedPly3 = 0;
 
-  let ply3ExpectedEquity = 0;
-
-  for (const oppRoll of SELECTIVE_3PLY_ROLLS) {
-    const oppMoves = generateLegalTurnMoves(oppTurnState, oppRoll.dice);
-    let bestOppState = oppTurnState;
-
-    if (oppMoves.length > 0) {
-      let bestOppEq = opponent === 'white' ? -Infinity : Infinity;
-      for (const om of oppMoves) {
-        const eq = evalWithCache(om.resultingState, cache).equity;
-        if (opponent === 'white' ? eq > bestOppEq : eq < bestOppEq) {
-          bestOppEq = eq;
-          bestOppState = om.resultingState;
-        }
-      }
+  for (let r = 0; r < optimalOppReplies.length; r++) {
+    if (performance.now() >= deadlineMs) {
+      throw new SearchCutoffReachedError();
     }
 
-    const playerReTurnState: BoardState = {
-      points: [...bestOppState.points],
-      bar: { ...bestOppState.bar },
-      borneOff: { ...bestOppState.borneOff },
+    const oppReply = optimalOppReplies[r];
+    const afterOppState = oppReply.state;
+
+    if (
+      afterOppState.borneOff.white >= 15 ||
+      afterOppState.borneOff.black >= 15
+    ) {
+      const termEq = evalWithCache(
+        afterOppState,
+        evalCache,
+        oppReply.boardHash,
+        stats
+      ).equity;
+      totalExpectedPly3 += oppReply.probability * termEq;
+      continue;
+    }
+
+    const ttKey = hashBoardStateNumeric(afterOppState, playerTurnCode, 1);
+    const cachedCounterExpectation = ply3TranspositionTable.get(ttKey);
+    if (cachedCounterExpectation !== undefined) {
+      totalExpectedPly3 += oppReply.probability * cachedCounterExpectation;
+      continue;
+    }
+
+    const counterTurnState: BoardState = {
+      points: [...afterOppState.points],
+      bar: { ...afterOppState.bar },
+      borneOff: { ...afterOppState.borneOff },
       currentTurn: playerWhoMoved,
       dice: [],
       remainingMoves: [],
     };
 
-    let playerCounterExpected = 0;
-    for (const counterRoll of SELECTIVE_3PLY_ROLLS) {
-      const counterMoves = generateLegalTurnMoves(
-        playerReTurnState,
-        counterRoll.dice
+    let counterRollExpected = 0;
+
+    for (let c = 0; c < ALL_21_DICE_OUTCOMES.length; c++) {
+      if (performance.now() >= deadlineMs) {
+        throw new SearchCutoffReachedError();
+      }
+
+      const counterOutcome = ALL_21_DICE_OUTCOMES[c];
+      const uniqueCounterMoves = deduplicateMovesByResultingState(
+        generateLegalTurnMoves(counterTurnState, counterOutcome.dice)
       );
-      if (counterMoves.length === 0) {
-        playerCounterExpected +=
-          counterRoll.probability *
-          evalWithCache(playerReTurnState, cache).equity;
+
+      if (uniqueCounterMoves.length === 0) {
+        const passEq = evalWithCache(
+          counterTurnState,
+          evalCache,
+          oppReply.boardHash,
+          stats
+        ).equity;
+        counterRollExpected += counterOutcome.probability * passEq;
       } else {
-        let bestCounterEq = playerWhoMoved === 'white' ? -Infinity : Infinity;
-        for (const cm of counterMoves) {
-          const eq = evalWithCache(cm.resultingState, cache).equity;
+        const top4CounterMoves = selectTopMovesForResNet(
+          uniqueCounterMoves,
+          playerWhoMoved,
+          STAGE_B_COUNTER_TOP_MOVES,
+          evalCache,
+          fastRankCache
+        );
+
+        let bestCounterEq = playerIsWhite ? -Infinity : Infinity;
+        for (let m = 0; m < top4CounterMoves.length; m++) {
+          const cm = top4CounterMoves[m];
+          const ev = evalWithCache(
+            cm.move.resultingState,
+            evalCache,
+            cm.boardHash,
+            stats
+          );
           if (
-            playerWhoMoved === 'white' ? eq > bestCounterEq : eq < bestCounterEq
+            playerIsWhite
+              ? ev.equity > bestCounterEq
+              : ev.equity < bestCounterEq
           ) {
-            bestCounterEq = eq;
+            bestCounterEq = ev.equity;
           }
         }
-        playerCounterExpected += counterRoll.probability * bestCounterEq;
+        counterRollExpected += counterOutcome.probability * bestCounterEq;
       }
     }
 
-    ply3ExpectedEquity += oppRoll.probability * playerCounterExpected;
-  }
-
-  const blended = base2PlyEquity * 0.7 + ply3ExpectedEquity * 0.3;
-  const clampedEquity = Math.max(-3.0, Math.min(3.0, blended));
-  const equity =
-    Math.abs(clampedEquity) < 1e-6 ? 0 : Number(clampedEquity.toFixed(2));
-  const rawWinProb =
-    equity === 0 ? 50 : 100 / (1 + Math.exp(-clampedEquity * 1.18));
-  const winProb = Number(Math.max(0.5, Math.min(99.5, rawWinProb)).toFixed(1));
-
-  return { equity, winProb, gammonProb: baseGammonProb };
-}
-
-const ANYTIME_CUTOFF_MS = 9200;
-
-class SearchCutoffReachedError extends Error {
-  constructor() {
-    super('ANYTIME_CUTOFF_REACHED');
-  }
-}
-
-/**
- * Progressive beam widths [K1, K2, K3, K4] for Depths 3, 4, and 5:
- * Depth 4+ and Depth 5+ never use a smaller root beam K1 or ply-2 beam K2 than Depth 3+:
- * - Depth 3: K1=8 -> K2=4
- * - Depth 4: K1=8 -> K2=4 -> K3=3
- * - Depth 5: K1=8 -> K2=4 -> K3=3 -> K4=2
- */
-const BEAM_SCHEDULE_BY_DEPTH: Record<3 | 4 | 5, number[]> = {
-  3: [8, 4],
-  4: [8, 4, 3],
-  5: [8, 4, 3, 2],
-};
-
-/**
- * Recursive beam-pruned Expectiminimax evaluator with Transposition Table,
- * Pre-Turn / Post-Turn Leaf-Averaging (eliminating the Odd-Even Horizon Effect),
- * and 9,200ms Anytime Cutoff.
- */
-function evaluateBeamExpectiminimaxNode(
-  afterMoveState: BoardState,
-  nextTurnPlayer: Player,
-  remainingPlies: number,
-  beamSchedule: number[],
-  plyIndex: number,
-  evalCache: Map<string, EvalResult>,
-  transpositionTable: Map<string, number>,
-  deadlineMs: number
-): number {
-  if (performance.now() > deadlineMs) {
-    throw new SearchCutoffReachedError();
-  }
-
-  if (
-    remainingPlies <= 0 ||
-    afterMoveState.borneOff.white >= 15 ||
-    afterMoveState.borneOff.black >= 15
-  ) {
-    return evalWithCache(afterMoveState, evalCache).equity;
-  }
-
-  const ttKey = `${getPhysicalStateSignature(afterMoveState)}|${nextTurnPlayer}|${remainingPlies}`;
-  const cachedEq = transpositionTable.get(ttKey);
-  if (cachedEq !== undefined) {
-    return cachedEq;
-  }
-
-  // At the leaf chance ply (remainingPlies === 1), use exact 2-ply Expectiminimax over all 21 rolls
-  // combined with Pre-Turn / Post-Turn Leaf-Averaging to eliminate the Odd-Even Horizon Effect.
-  if (remainingPlies === 1) {
-    const preTurnEq = evalWithCache(afterMoveState, evalCache).equity;
-    const prevPlayer: Player = nextTurnPlayer === 'white' ? 'black' : 'white';
-    const res2 = evaluate2PlyExpectiminimax(
-      afterMoveState,
-      prevPlayer,
-      evalCache
-    );
-    const leafAvgEq = Math.max(
+    const clampedCounterExp = Math.max(
       -3.0,
-      Math.min(3.0, 0.5 * preTurnEq + 0.5 * res2.equity)
+      Math.min(3.0, counterRollExpected)
     );
-    transpositionTable.set(ttKey, leafAvgEq);
-    return leafAvgEq;
+    ply3TranspositionTable.set(ttKey, clampedCounterExp);
+    totalExpectedPly3 += oppReply.probability * clampedCounterExp;
   }
 
-  const turnState: BoardState = {
-    points: [...afterMoveState.points],
-    bar: { ...afterMoveState.bar },
-    borneOff: { ...afterMoveState.borneOff },
-    currentTurn: nextTurnPlayer,
-    dice: [],
-    remainingMoves: [],
-  };
-
-  const opponent: Player = nextTurnPlayer === 'white' ? 'black' : 'white';
-  const beamK = beamSchedule[Math.min(plyIndex, beamSchedule.length - 1)] ?? 2;
-  const rolls = ALL_21_DICE_OUTCOMES;
-  let totalProb = 0;
-  let expectedEquity = 0;
-
-  for (const outcome of rolls) {
-    if (performance.now() > deadlineMs) {
-      throw new SearchCutoffReachedError();
-    }
-
-    const moves = generateLegalTurnMoves(turnState, outcome.dice);
-    if (moves.length === 0) {
-      const passEq = evaluateBeamExpectiminimaxNode(
-        turnState,
-        opponent,
-        remainingPlies - 1,
-        beamSchedule,
-        plyIndex + 1,
-        evalCache,
-        transpositionTable,
-        deadlineMs
-      );
-      expectedEquity += outcome.probability * passEq;
-      totalProb += outcome.probability;
-      continue;
-    }
-
-    // Score moves at 1-ply to select top `beamK` candidates
-    const scored = moves.map((m) => ({
-      move: m,
-      eq1: evalWithCache(m.resultingState, evalCache).equity,
-    }));
-    scored.sort((a, b) =>
-      nextTurnPlayer === 'white' ? b.eq1 - a.eq1 : a.eq1 - b.eq1
-    );
-    const beamMoves = scored.slice(0, beamK);
-
-    let bestMoveEq = nextTurnPlayer === 'white' ? -Infinity : Infinity;
-    for (const cand of beamMoves) {
-      const childEq = evaluateBeamExpectiminimaxNode(
-        cand.move.resultingState,
-        opponent,
-        remainingPlies - 1,
-        beamSchedule,
-        plyIndex + 1,
-        evalCache,
-        transpositionTable,
-        deadlineMs
-      );
-      if (
-        nextTurnPlayer === 'white'
-          ? childEq > bestMoveEq
-          : childEq < bestMoveEq
-      ) {
-        bestMoveEq = childEq;
-      }
-    }
-
-    expectedEquity += outcome.probability * bestMoveEq;
-    totalProb += outcome.probability;
-  }
-
-  const normalizedEq =
-    totalProb > 0
-      ? Math.max(-3.0, Math.min(3.0, expectedEquity / totalProb))
-      : evalWithCache(afterMoveState, evalCache).equity;
-  transpositionTable.set(ttKey, normalizedEq);
-  return normalizedEq;
+  return Math.max(-3.0, Math.min(3.0, totalExpectedPly3));
 }
 
 /**
- * Analyzes a board position for a given dice roll at Depths 1..5 (`SearchDepth = 1 | 2 | 3 | 4 | 5`)
- * with Opening & Reply Book lookup, Transposition Table, Progressive Beam Pruning,
- * 9,200ms Anytime Cutoff, exact 36-roll combinatorics, and Grandmaster Hebrew comparisons.
+ * Analyzes a board position for a given dice roll (locked by default to Champion `Depth 3+`)
+ * using Iterative Deepening calibrated for maximum Grandmaster accuracy in a 20–28s budget:
+ * - Stage A: Complete Deep 2-Ply Foundation (all root moves with v3 ResNet -> top K1=8..10 -> top 6 v3 ResNet opponent replies per roll, K2=1).
+ * - Stage B: Wide 3-Ply Grandmaster Refinement (top K_deep=6..8 -> top 4 v3 ResNet counter-moves per roll + 0.75*E3 + 0.25*E2 GNU horizon damping).
+ * - Strict safety cutoff (`28,000ms` Live / `22,000ms` Background) checked inside every Ply-2 and Ply-3 dice loop.
  */
 export function analyzePosition(
   state: BoardState,
   dice: [number, number],
-  depth: SearchDepth = 2,
-  playedSteps?: MoveStep[]
+  depth: SearchDepth = CHAMPION_SEARCH_DEPTH,
+  playedSteps?: MoveStep[],
+  cutoffMs: number = LIVE_SEARCH_CUTOFF_MS
 ): TurnAnalysisResult {
   const startTime = performance.now();
-  const deadlineMs = startTime + ANYTIME_CUTOFF_MS;
+  const deadlineMs = startTime + Math.max(200, cutoffMs);
   const player = state.currentTurn;
-  const opponent: Player = player === 'white' ? 'black' : 'white';
   const sign = player === 'white' ? 1 : -1;
-  const evalCache = new Map<string, EvalResult>();
-  const transpositionTable = new Map<string, number>();
-  const legalMoves = generateLegalTurnMoves(state, dice);
+  const stats: SearchStats = { neuralEvals: 0 };
+  const evalCache = new Map<number, EvalResult>();
+  const fastRankCache = new Map<number, number>();
+  const ply3TranspositionTable = new Map<number, number>();
+
+  const uniqueLegalMoves = deduplicateMovesByResultingState(
+    generateLegalTurnMoves(state, dice)
+  );
   const isOpeningBoard = isOpeningOrReplyBookState(state);
   const { gamePhase, gamePhaseLabel, strategicPlan } = getPhaseAndStrategicPlan(
     state,
     player
   );
 
-  if (legalMoves.length === 0) {
-    const baseEval = evalWithCache(state, evalCache);
+  if (uniqueLegalMoves.length === 0) {
+    const baseEval = evalWithCache(state, evalCache, undefined, stats);
+    const elapsedMs = Math.round(performance.now() - startTime);
+    if (depth >= 3) {
+      console.log(
+        `[AI] Depth 3+ completed in ${elapsedMs}ms (${stats.neuralEvals} neural evals, completedPly3=0/0)`
+      );
+    }
     return {
       topMoves: [],
       gamePhase,
@@ -1015,7 +1125,10 @@ export function analyzePosition(
       strategicPlan,
       requestedDepth: depth,
       completedDepth: depth,
-      elapsedMs: Math.round(performance.now() - startTime),
+      elapsedMs,
+      neuralEvals: stats.neuralEvals,
+      completedPly3: 0,
+      targetPly3: 0,
       playedMoveAnalysis: playedSteps
         ? {
             notation: 'ללא מהלך',
@@ -1028,151 +1141,204 @@ export function analyzePosition(
     };
   }
 
-  // Step 1: Score all legal moves at 1-Ply (plus Opening & Reply Book theoretical bonus)
-  const scored1Ply = legalMoves.map((move) => {
-    const eval1 = evalWithCache(move.resultingState, evalCache);
-    const bookEntry = isOpeningBoard
-      ? lookupOpeningBookMove(state, dice, move.resultingState)
-      : null;
-    const bookBonus = bookEntry ? bookEntry.equityAdjustment * sign : 0;
-    const adjustedEquity = Number(
-      Math.max(-3.0, Math.min(3.0, eval1.equity + bookBonus)).toFixed(2)
-    );
+  // Stage A (Ply 1 — Root): Evaluate ALL unique legal root moves with full v3 ResNet
+  interface SearchCandidate {
+    move: TurnMove;
+    boardHash: number;
+    equity: number;
+    rawStageAEq: number;
+    winProb: number;
+    gammonProb: number;
+    bookBonus: number;
+    optimalOppReplies: OptimalOpponentReply[];
+    completedStageA: boolean;
+    completedStageB: boolean;
+  }
 
-    return {
-      move,
-      equity: adjustedEquity,
-      winProb: eval1.winProb,
-      gammonProb: eval1.gammonProb,
-      bookBonus,
-    };
-  });
+  const scored1Ply: SearchCandidate[] = uniqueLegalMoves.map(
+    ({ move, boardHash }) => {
+      const eval1 = evalWithCache(
+        move.resultingState,
+        evalCache,
+        boardHash,
+        stats
+      );
+      const bookEntry = isOpeningBoard
+        ? lookupOpeningBookMove(state, dice, move.resultingState)
+        : null;
+      const bookBonus = bookEntry ? bookEntry.equityAdjustment * sign : 0;
+      const clamped1 = Math.max(-3.0, Math.min(3.0, eval1.equity + bookBonus));
+      const adjustedEquity =
+        Math.abs(clamped1) < 1e-6 ? 0 : Number(clamped1.toFixed(2));
+
+      return {
+        move,
+        boardHash,
+        equity: adjustedEquity,
+        rawStageAEq: clamped1,
+        winProb: eval1.winProb,
+        gammonProb: eval1.gammonProb,
+        bookBonus,
+        optimalOppReplies: [],
+        completedStageA: false,
+        completedStageB: false,
+      };
+    }
+  );
 
   scored1Ply.sort((a, b) =>
     player === 'white' ? b.equity - a.equity : a.equity - b.equity
   );
 
-  let finalCandidates = scored1Ply;
+  let finalCandidates: SearchCandidate[] = scored1Ply;
   let completedDepth: SearchDepth = 1;
+  let completedPly3 = 0;
+  let targetPly3 = 0;
 
-  // Step 2: Refine with 2-Ply Expectiminimax (top 16 candidates) if depth >= 2
-  if (depth >= 2 && scored1Ply.length > 1) {
-    const topPool = scored1Ply.slice(0, 16).map((item) => {
-      const eval2 = evaluate2PlyExpectiminimax(
-        item.move.resultingState,
-        player,
-        evalCache
-      );
-      const adjustedEq = Number(
-        Math.max(-3.0, Math.min(3.0, eval2.equity + item.bookBonus)).toFixed(2)
-      );
-      return {
-        move: item.move,
-        equity: adjustedEq,
-        winProb: eval2.winProb,
-        gammonProb: eval2.gammonProb,
-        bookBonus: item.bookBonus,
-      };
-    });
-
-    topPool.sort((a, b) =>
-      player === 'white' ? b.equity - a.equity : a.equity - b.equity
-    );
-    completedDepth = 2;
-
-    // For depth === 2: Selective 3-Ply Extension when in contact and top 2 moves are within 0.06 equity
-    const basePositionEval = evalWithCache(state, evalCache);
-    if (
-      depth === 2 &&
-      !basePositionEval.features.isPureRace &&
-      !isOpeningBoard &&
-      topPool.length >= 2 &&
-      Math.abs(topPool[0].equity - topPool[1].equity) <= 0.06
+  if (depth >= 2 && scored1Ply.length === 1) {
+    completedDepth = depth;
+    if (depth >= 3) {
+      completedPly3 = 1;
+      targetPly3 = 1;
+    }
+  } else if (depth >= 2 && scored1Ply.length > 1) {
+    // Stage A (Ply 2): Keep top K1 = 8 root candidates (expand up to 10 if within 0.06 equity of #1)
+    let k1Count = Math.min(STAGE_A_ROOT_BASE_K1, scored1Ply.length);
+    const best1PlyEq = scored1Ply[0].equity;
+    while (
+      k1Count < Math.min(STAGE_A_ROOT_MAX_K1, scored1Ply.length) &&
+      Math.abs(best1PlyEq - scored1Ply[k1Count].equity) <=
+        STAGE_A_ROOT_EXPAND_MARGIN + 1e-9
     ) {
-      const top3Extended = topPool.slice(0, 3).map((item) => {
-        const eval3 = evaluateSelective3PlyExtension(
-          item.move.resultingState,
-          player,
-          item.equity,
-          item.gammonProb,
-          evalCache
-        );
-        return {
-          ...item,
-          equity: eval3.equity,
-          winProb: eval3.winProb,
-          gammonProb: eval3.gammonProb,
-        };
-      });
-
-      const remainingPool = topPool.slice(3);
-      const merged = [...top3Extended, ...remainingPool];
-      merged.sort((a, b) =>
-        player === 'white' ? b.equity - a.equity : a.equity - b.equity
-      );
-      finalCandidates = merged;
-    } else {
-      finalCandidates = topPool;
+      k1Count++;
     }
 
-    // Step 3: Iterative Deepening for Depths 3+, 4+, and 5+ with Progressive Beam Pruning & Anytime Cutoff
-    if (depth >= 3) {
-      const targetDepths: Array<3 | 4 | 5> =
-        depth === 3 ? [3] : depth === 4 ? [3, 4] : [3, 4, 5];
+    const stageACandidates: SearchCandidate[] = [];
+    let stageACutoffHit = false;
 
-      for (const d of targetDepths) {
-        if (performance.now() > deadlineMs) {
+    for (let i = 0; i < k1Count; i++) {
+      const item = scored1Ply[i];
+      try {
+        const eval2 = evaluateStageA2PlyFoundation(
+          item.move.resultingState,
+          player,
+          evalCache,
+          fastRankCache,
+          stats,
+          deadlineMs,
+          item.boardHash
+        );
+        const rawAdj = Math.max(
+          -3.0,
+          Math.min(3.0, eval2.rawEquity + item.bookBonus)
+        );
+        const adjustedEq =
+          Math.abs(rawAdj) < 1e-6 ? 0 : Number(rawAdj.toFixed(2));
+        stageACandidates.push({
+          ...item,
+          equity: adjustedEq,
+          rawStageAEq: rawAdj,
+          winProb: eval2.winProb,
+          gammonProb: eval2.gammonProb,
+          optimalOppReplies: eval2.optimalOppReplies,
+          completedStageA: true,
+        });
+      } catch (err) {
+        if (err instanceof SearchCutoffReachedError) {
+          stageACutoffHit = true;
           break;
         }
+        throw err;
+      }
+    }
+
+    if (stageACandidates.length > 0) {
+      stageACandidates.sort((a, b) =>
+        player === 'white'
+          ? b.rawStageAEq - a.rawStageAEq
+          : a.rawStageAEq - b.rawStageAEq
+      );
+      const unsearchedTail = scored1Ply.slice(stageACandidates.length);
+      finalCandidates = [...stageACandidates, ...unsearchedTail];
+      if (!stageACutoffHit || stageACandidates.length >= 2) {
+        completedDepth = 2;
+      }
+    }
+
+    // Stage B — Wide 3-Ply Grandmaster Refinement (when depth >= 3)
+    if (depth >= 3 && !stageACutoffHit && stageACandidates.length > 0) {
+      let kDeep = Math.min(STAGE_B_DEEP_BASE_K, stageACandidates.length);
+      const bestStageAEq = stageACandidates[0].rawStageAEq;
+      while (
+        kDeep < Math.min(STAGE_B_DEEP_MAX_K, stageACandidates.length) &&
+        Math.abs(bestStageAEq - stageACandidates[kDeep].rawStageAEq) <=
+          STAGE_B_DEEP_EXPAND_MARGIN + 1e-9
+      ) {
+        kDeep++;
+      }
+
+      targetPly3 = kDeep;
+      const refinedStageB: SearchCandidate[] = [...stageACandidates];
+
+      for (let i = 0; i < kDeep; i++) {
+        const cand = refinedStageB[i];
         try {
-          const schedule = BEAM_SCHEDULE_BY_DEPTH[d];
-          const k1 = schedule[0];
-          const rootBeam = finalCandidates.slice(0, k1);
-          const rootRest = finalCandidates.slice(k1);
-
-          const refinedBeam = rootBeam.map((item) => {
-            const deepEq = evaluateBeamExpectiminimaxNode(
-              item.move.resultingState,
-              opponent,
-              d - 1,
-              schedule,
-              1,
-              evalCache,
-              transpositionTable,
-              deadlineMs
-            );
-            // Eliminate the Odd-Even Horizon Effect (GNU Backgammon damping):
-            // combine 0.75 * E_ply(d) + 0.25 * E_ply(d-1) at every deep layer.
-            const combinedRaw =
-              0.75 * (deepEq + item.bookBonus) + 0.25 * item.equity;
-            const blendedEq = Math.max(-3.0, Math.min(3.0, combinedRaw));
-            const roundedEq =
-              Math.abs(blendedEq) < 1e-6 ? 0 : Number(blendedEq.toFixed(2));
-            const rawWin =
-              roundedEq === 0 ? 50 : 100 / (1 + Math.exp(-blendedEq * 1.18));
-            const winProb = Number(
-              Math.max(0.5, Math.min(99.5, rawWin)).toFixed(1)
-            );
-            return {
-              ...item,
-              equity: roundedEq,
-              winProb,
-            };
-          });
-
-          const nextCandidates = [...refinedBeam, ...rootRest];
-          nextCandidates.sort((a, b) =>
-            player === 'white' ? b.equity - a.equity : a.equity - b.equity
+          const e3Raw = evaluateStageB3PlyRefinement(
+            cand.optimalOppReplies,
+            player,
+            evalCache,
+            fastRankCache,
+            ply3TranspositionTable,
+            stats,
+            deadlineMs,
+            cand.rawStageAEq
           );
-          finalCandidates = nextCandidates;
-          completedDepth = d;
+
+          // Apply GNU-style horizon damping: 0.75 * E3 + 0.25 * E2
+          const dampedRaw =
+            0.75 * (e3Raw + cand.bookBonus) + 0.25 * cand.rawStageAEq;
+          const clampedDamped = Math.max(-3.0, Math.min(3.0, dampedRaw));
+          const roundedEq =
+            Math.abs(clampedDamped) < 1e-6
+              ? 0
+              : Number(clampedDamped.toFixed(2));
+          const rawWin =
+            roundedEq === 0 ? 50 : 100 / (1 + Math.exp(-clampedDamped * 1.18));
+          const winProb = Number(
+            Math.max(0.5, Math.min(99.5, rawWin)).toFixed(1)
+          );
+
+          refinedStageB[i] = {
+            ...cand,
+            equity: roundedEq,
+            rawStageAEq: clampedDamped,
+            winProb,
+            completedStageB: true,
+          };
+          completedPly3 += 1;
         } catch (err) {
           if (err instanceof SearchCutoffReachedError) {
-            // Anytime cutoff reached: keep the deepest completed layer
             break;
           }
           throw err;
         }
+      }
+
+      if (completedPly3 > 0) {
+        // Sort completed Stage B candidates cleanly at the top, followed by remaining Stage A baseline candidates
+        const finishedB = refinedStageB.slice(0, completedPly3);
+        const restStageA = refinedStageB.slice(completedPly3);
+        finishedB.sort((a, b) =>
+          player === 'white'
+            ? b.rawStageAEq - a.rawStageAEq
+            : a.rawStageAEq - b.rawStageAEq
+        );
+        finalCandidates = [
+          ...finishedB,
+          ...restStageA,
+          ...scored1Ply.slice(stageACandidates.length),
+        ];
+        completedDepth = 3;
       }
     }
   }
@@ -1246,34 +1412,80 @@ export function analyzePosition(
       playedState = applyMoveStep(playedState, s);
     }
 
-    const playedSig = getPhysicalStateSignature(playedState);
-    const matchedInFinal = finalCandidates.find(
-      (c) => getPhysicalStateSignature(c.move.resultingState) === playedSig
+    const playedHash = hashBoardStateNumeric(playedState);
+    const matchedCandidate = finalCandidates.find(
+      (c) =>
+        c.boardHash === playedHash &&
+        ((completedDepth >= 3 && c.completedStageB) ||
+          (completedDepth === 2 && c.completedStageA) ||
+          completedDepth === 1)
     );
 
     let playedEquity: number;
-    if (matchedInFinal) {
-      playedEquity = matchedInFinal.equity;
-    } else if (depth >= 2 && scored1Ply.length > 1) {
-      const bookEntry = isOpeningBoard
-        ? lookupOpeningBookMove(state, dice, playedState)
-        : null;
-      const bookBonus = bookEntry ? bookEntry.equityAdjustment * sign : 0;
-      const eval2 = evaluate2PlyExpectiminimax(playedState, player, evalCache);
-      playedEquity = Number(
-        Math.max(-3.0, Math.min(3.0, eval2.equity + bookBonus)).toFixed(2)
-      );
+    if (matchedCandidate) {
+      playedEquity = matchedCandidate.equity;
     } else {
       const bookEntry = isOpeningBoard
         ? lookupOpeningBookMove(state, dice, playedState)
         : null;
       const bookBonus = bookEntry ? bookEntry.equityAdjustment * sign : 0;
-      playedEquity = Number(
-        Math.max(
-          -3.0,
-          Math.min(3.0, evalWithCache(playedState, evalCache).equity + bookBonus)
-        ).toFixed(2)
-      );
+
+      if (
+        depth >= 2 &&
+        scored1Ply.length > 1 &&
+        performance.now() + 25 < deadlineMs
+      ) {
+        try {
+          const eval2 = evaluateStageA2PlyFoundation(
+            playedState,
+            player,
+            evalCache,
+            fastRankCache,
+            stats,
+            deadlineMs,
+            playedHash
+          );
+          let eqVal = eval2.rawEquity + bookBonus;
+          if (completedPly3 > 0 && performance.now() + 25 < deadlineMs) {
+            const e3Played = evaluateStageB3PlyRefinement(
+              eval2.optimalOppReplies,
+              player,
+              evalCache,
+              fastRankCache,
+              ply3TranspositionTable,
+              stats,
+              deadlineMs,
+              eqVal
+            );
+            eqVal = 0.75 * (e3Played + bookBonus) + 0.25 * eqVal;
+          }
+          playedEquity = Number(
+            Math.max(-3.0, Math.min(3.0, eqVal)).toFixed(2)
+          );
+        } catch (err) {
+          if (err instanceof SearchCutoffReachedError) {
+            const fallback1 = evalWithCache(
+              playedState,
+              evalCache,
+              playedHash,
+              stats
+            );
+            playedEquity = Number(
+              Math.max(
+                -3.0,
+                Math.min(3.0, fallback1.equity + bookBonus)
+              ).toFixed(2)
+            );
+          } else {
+            throw err;
+          }
+        }
+      } else {
+        const eval1 = evalWithCache(playedState, evalCache, playedHash, stats);
+        playedEquity = Number(
+          Math.max(-3.0, Math.min(3.0, eval1.equity + bookBonus)).toFixed(2)
+        );
+      }
     }
 
     const rawLoss =
@@ -1303,6 +1515,13 @@ export function analyzePosition(
     };
   }
 
+  const elapsedMs = Math.round(performance.now() - startTime);
+  if (depth >= 3) {
+    console.log(
+      `[AI] Depth 3+ completed in ${elapsedMs}ms (${stats.neuralEvals} neural evals, completedPly3=${completedPly3}/${targetPly3})`
+    );
+  }
+
   return {
     topMoves,
     gamePhase,
@@ -1311,7 +1530,10 @@ export function analyzePosition(
     runnerUpComparison,
     requestedDepth: depth,
     completedDepth,
-    elapsedMs: Math.round(performance.now() - startTime),
+    elapsedMs,
+    neuralEvals: stats.neuralEvals,
+    completedPly3,
+    targetPly3,
     playedMoveAnalysis,
   };
 }

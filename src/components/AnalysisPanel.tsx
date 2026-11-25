@@ -18,7 +18,6 @@ import {
 import {
   getClassificationMeta,
   type CandidateMoveAnalysis,
-  type SearchDepth,
   type TurnAnalysisResult,
 } from '../engine/ai';
 import { getEngineModelInfo } from '../engine/evaluator';
@@ -28,12 +27,14 @@ import type { MoveStep, Player } from '../engine/types';
 interface AnalysisPanelProps {
   analysis: TurnAnalysisResult | null;
   isThinking: boolean;
-  thinkingDepth?: SearchDepth;
   thinkingElapsedMs?: number;
   activePlayer: Player;
   dice: [number, number] | null;
   isViewingHistory: boolean;
+  isHistoryTurnAnalyzing?: boolean;
   historyTurnNumber?: number;
+  isOpponentTurnOrAnimating?: boolean;
+  hasGenuineNoLegalMoves?: boolean;
   showLiveHint: boolean;
   onToggleLiveHint: () => void;
   onHoverMoveSteps: (steps: MoveStep[] | null) => void;
@@ -52,12 +53,14 @@ function formatSignedEquity(eq: number): string {
 export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
   analysis,
   isThinking,
-  thinkingDepth = 2,
   thinkingElapsedMs = 0,
   activePlayer,
   dice,
   isViewingHistory,
+  isHistoryTurnAnalyzing = false,
   historyTurnNumber,
+  isOpponentTurnOrAnimating = false,
+  hasGenuineNoLegalMoves = false,
   showLiveHint,
   onToggleLiveHint,
   onHoverMoveSteps,
@@ -98,6 +101,10 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
               ? `ניתוח רב-אמן AI — תור #${historyTurnNumber} (הקווים המומלצים ביותר)`
               : 'ניתוח רב-אמן AI — הקווים המומלצים ביותר'}
           </h3>
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-500/35 text-[10px] font-semibold">
+            <Cpu className="w-3 h-3 text-cyan-400" />
+            מנוע רב-אמן AI (עומק 3+)
+          </span>
           <span
             className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
               modelInfo.hasNeuralNet
@@ -112,8 +119,7 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
             <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-500/40 text-[10px] font-mono font-bold">
               <Loader2 className="w-3 h-3 animate-spin text-cyan-400" />
               <span>
-                מנתח עמדה (עומק {thinkingDepth}
-                {thinkingDepth >= 2 ? '+' : ''}
+                מנתח עמדה (עומק 3+
                 {thinkingElapsedMs >= 100
                   ? ` • ${(thinkingElapsedMs / 1000).toFixed(1)}s`
                   : ''}
@@ -121,13 +127,10 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
               </span>
             </span>
           ) : (
-            analysis?.completedDepth && (
+            analysis?.elapsedMs !== undefined &&
+            analysis.elapsedMs >= 50 && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-800/90 text-cyan-300 border border-slate-700 text-[10px] font-mono">
-                עומק {analysis.completedDepth}
-                {analysis.completedDepth >= 2 ? '+' : ''}
-                {analysis.elapsedMs !== undefined && analysis.elapsedMs >= 50
-                  ? ` (${(analysis.elapsedMs / 1000).toFixed(1)}s)`
-                  : ''}
+                עומק 3+ ({(analysis.elapsedMs / 1000).toFixed(1)}s)
               </span>
             )
           )}
@@ -226,6 +229,19 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
               </span>
             </div>
           </div>
+        ) : !isViewingHistory && isOpponentTurnOrAnimating ? (
+          <div className="flex items-center gap-2.5 py-3 px-3.5 rounded-xl bg-slate-950/55 border border-slate-800/80 text-xs text-slate-300">
+            {isThinking ? (
+              <Loader2 className="w-4 h-4 animate-spin text-cyan-400 shrink-0" />
+            ) : (
+              <Cpu className="w-4 h-4 text-sky-400 shrink-0" />
+            )}
+            <span>
+              {isThinking
+                ? 'היריב (שחור) מחשב מהלך בעומק 3+ — ממתין לסיום תור היריב...'
+                : 'ממתין לסיום תור היריב...'}
+            </span>
+          </div>
         ) : !dice ? (
           <div className="flex items-center gap-2.5 py-3 px-3 rounded-xl bg-slate-950/40 border border-slate-800/70 text-xs text-slate-400">
             <Cpu className="w-4 h-4 text-cyan-400/70 shrink-0" />
@@ -234,18 +250,23 @@ export const AnalysisPanel: React.FC<AnalysisPanelProps> = ({
               ResNet ייעודיות + טבלת סיומים מדויקת) ולהציג חצים טקטיים על הלוח.
             </span>
           </div>
-        ) : isThinking && !analysis ? (
-          <div className="flex items-center justify-center gap-2 py-6 text-xs font-mono text-cyan-300">
-            <Loader2 className="w-4 h-4 animate-spin" />
-            מנתח עמדה על פני 21 תוצאות קובייה ו-36 צירופי הסתברות...
-          </div>
-        ) : !analysis || analysis.topMoves.length === 0 ? (
+        ) : !isOpponentTurnOrAnimating && hasGenuineNoLegalMoves ? (
           <div className="py-3 px-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-200">
             אין מהלכים חוקיים עבור הטלת הקוביות{' '}
             <span dir="ltr" className="inline-block font-mono font-bold">
               {dice[0]}-{dice[1]}
             </span>
             .
+          </div>
+        ) : !analysis ||
+          analysis.topMoves.length === 0 ||
+          ((isThinking || (isViewingHistory && isHistoryTurnAnalyzing)) &&
+            !analysis) ? (
+          <div className="flex items-center justify-center gap-2 py-6 text-xs font-mono text-cyan-300">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            {isViewingHistory
+              ? 'משלים ניתוח רב-אמן (עומק 3+) לתור זה ברקע...'
+              : 'מנתח עמדה בעומק 3+ על פני 21 תוצאות קובייה ו-36 צירופי הסתברות...'}
           </div>
         ) : (
           <div className="space-y-3">

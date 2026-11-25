@@ -541,7 +541,10 @@ function computeGammonAndBackgammonRates(
  * - Priority 3: Trained Dual Neural Network (ContactNet / RaceNet) when loaded.
  * - Priority 4: Hybrid Multi-Factor Positional + Exact Bear-Off Expected Turns & Kleinman Race Evaluator.
  */
-export function evaluatePosition(state: BoardState): EvalResult {
+export function evaluatePosition(
+  state: BoardState,
+  useNeuralNet: boolean = true
+): EvalResult {
   const isPureRace = isPureRacePosition(state);
   const white = computePlayerMetrics(state, 'white', isPureRace);
   const black = computePlayerMetrics(state, 'black', isPureRace);
@@ -719,7 +722,7 @@ export function evaluatePosition(state: BoardState): EvalResult {
       : Number(Math.min(45, totalBackgammonPct).toFixed(1));
 
   // Priority 3: 90% Trained v3 3-Network Residual Neural Network + 10% Tactical Feature Anchor
-  const nn = getActiveNeuralNet();
+  const nn = useNeuralNet ? getActiveNeuralNet() : null;
   if (nn && nn.metadata.trainedGames > 0) {
     const gamePhase = classifyGamePhase(state);
     const nnEval = nn.evaluateSymmetric(state, gamePhase);

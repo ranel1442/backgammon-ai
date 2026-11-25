@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart3,
   Bot,
   Brain,
   Camera,
   Check,
+  Cpu,
   Dices,
   Download,
   FlaskConical,
@@ -24,7 +25,7 @@ import { EvalBar } from './components/EvalBar';
 import { GameReviewPanel } from './components/GameReviewPanel';
 import { ImagePositionModal } from './components/ImagePositionModal';
 import { MoveHistory, type HistoryEntry } from './components/MoveHistory';
-import type { SearchDepth, TurnAnalysisResult } from './engine/ai';
+import type { TurnAnalysisResult } from './engine/ai';
 import { evaluatePosition } from './engine/evaluator';
 import { computeGameReview } from './engine/review';
 import {
@@ -39,13 +40,11 @@ import {
 import type { BoardState, MoveStep, Player } from './engine/types';
 import { useBackgammonAI } from './hooks/useBackgammonAI';
 
-type GameMode =
-  | 'local'
-  | 'ai-1ply'
-  | 'ai-2ply'
-  | 'ai-3ply'
-  | 'ai-4ply'
-  | 'ai-5ply';
+type GameMode = 'ai' | 'local';
+
+function normalizeGameMode(raw: unknown): GameMode {
+  return raw === 'local' ? 'local' : 'ai';
+}
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -117,7 +116,8 @@ function getHebrewVictoryTitle(win: WinSummary): string {
 }
 
 export function App() {
-  const [gameMode, setGameMode] = useState<GameMode>('ai-2ply');
+  const [gameMode, setGameMode] = useState<GameMode>('ai');
+  const turnSequenceRef = useRef(0);
   const [turnStartState, setTurnStartState] = useState<BoardState>(() =>
     createInitialBoard()
   );
@@ -148,6 +148,7 @@ export function App() {
   // Paced Opponent Playback & Replay State
   const [aiStatusBanner, setAiStatusBanner] = useState<string | null>(null);
   const [aiPlannedSteps, setAiPlannedSteps] = useState<MoveStep[] | null>(null);
+  const [isAIAnimating, setIsAIAnimating] = useState<boolean>(false);
   const [lastOpponentTurn, setLastOpponentTurn] =
     useState<LastOpponentTurnRecord | null>(null);
   const [showLastOpponentArrows, setShowLastOpponentArrows] =
@@ -182,14 +183,18 @@ export function App() {
 
   const {
     isThinking,
-    thinkingDepth,
     thinkingElapsedMs,
-    analyzeTurn,
+    computeAIMove,
+    analyzeLivePosition,
+    enqueueTurnAnalysis,
+    pendingAnalysisCount: workerQueueCount,
+    clearAnalysisQueue,
     isRollingOut,
     rolloutProgress,
     rolloutResults,
     runRollout,
     clearRolloutResults,
+    nnLoaded,
   } = useBackgammonAI();
 
   useEffect(() => {
@@ -255,42 +260,82 @@ export function App() {
     }
   }, [gameOver]);
 
-  // Queue any unanalyzed turns when Game Review is opened
+  const handleBackgroundTurnAnalyzed = useCallback(
+    (turnId: string, analysisRes: TurnAnalysisResult) => {
+      setHistory((prev) =>
+        prev.map((item) => {
+          if (item.turnId !== turnId) return item;
+          const playedEval = analysisRes.playedMoveAnalysis;
+          const refinedEq = playedEval?.equity ?? item.evalResult.equity;
+          const refinedWinProb =
+            refinedEq === 0
+              ? 50
+              : Number(
+                  Math.max(
+                    0.5,
+                    Math.min(99.5, 100 / (1 + Math.exp(-refinedEq * 1.18)))
+                  ).toFixed(1)
+                );
+          return {
+            ...item,
+            isAnalyzing: false,
+            classification: playedEval?.classification ?? 'Best',
+            equityLoss: playedEval?.equityLoss ?? 0,
+            playedEvaluation: playedEval,
+            analysis: analysisRes,
+            evalResult: {
+              ...item.evalResult,
+              equity: refinedEq,
+              winProb: refinedWinProb,
+            },
+          };
+        })
+      );
+    },
+    []
+  );
+
+  // Queue any unanalyzed imported turns on `analysisWorker` when Game Review is opened
   useEffect(() => {
     if (!showGameReview) return;
 
     history.forEach((entry) => {
-      if (!entry.analysis || !entry.classification) {
-        analyzeTurn(entry.turnStartState, entry.dice, 2, entry.steps, {
-          isBackground: true,
-        }).then((analysisRes) => {
-          setHistory((prev) =>
-            prev.map((item) =>
-              item.id === entry.id
-                ? {
-                    ...item,
-                    classification:
-                      analysisRes.playedMoveAnalysis?.classification ?? 'Best',
-                    equityLoss: analysisRes.playedMoveAnalysis?.equityLoss ?? 0,
-                    analysis: analysisRes,
-                  }
-                : item
-            )
-          );
-        });
+      if (!entry.analysis && !entry.classification && !entry.isAnalyzing) {
+        const tid = entry.turnId ?? `turn-import-${entry.id}`;
+        setHistory((prev) =>
+          prev.map((item) =>
+            item.id === entry.id
+              ? { ...item, turnId: tid, isAnalyzing: true }
+              : item
+          )
+        );
+        void enqueueTurnAnalysis(
+          tid,
+          entry.turnStartState,
+          entry.dice,
+          entry.steps,
+          handleBackgroundTurnAnalyzed
+        );
       }
     });
-  }, [showGameReview, history, analyzeTurn]);
+  }, [
+    showGameReview,
+    history,
+    enqueueTurnAnalysis,
+    handleBackgroundTurnAnalyzed,
+  ]);
 
   const gameReviewSummary = useMemo(
     () => computeGameReview(history),
     [history]
   );
 
-  const pendingAnalysisCount = useMemo(
-    () => history.filter((h) => !h.classification).length,
-    [history]
-  );
+  const pendingAnalysisCount = useMemo(() => {
+    const historyPending = history.filter(
+      (h) => Boolean(h.isAnalyzing) || !h.classification
+    ).length;
+    return Math.max(workerQueueCount, historyPending);
+  }, [history, workerQueueCount]);
 
   const legalTurnMoves = useMemo(() => {
     if (!activeRolledDice || activeGameOver) return [];
@@ -348,10 +393,29 @@ export function App() {
     isReplayingOpponent,
   ]);
 
-  const evalResult = useMemo(
-    () => evaluatePosition(displayedState),
-    [displayedState]
-  );
+  const evalResult = useMemo(() => {
+    void nnLoaded;
+    if (isSandboxMode || isReplayingOpponent) {
+      return evaluatePosition(displayedState);
+    }
+    if (inspectedEntry) {
+      return inspectedEntry.evalResult;
+    }
+    if (stepsTaken.length === 0 && history.length > 0) {
+      // Uses instant <2ms 1-ply eval immediately on turn commit, then smoothly
+      // refines to Depth 3+ equity if background analysis finishes before the next move!
+      return history[history.length - 1].evalResult;
+    }
+    return evaluatePosition(displayedState);
+  }, [
+    displayedState,
+    nnLoaded,
+    isSandboxMode,
+    isReplayingOpponent,
+    inspectedEntry,
+    stepsTaken.length,
+    history,
+  ]);
   const whitePips = useMemo(
     () => getPipCount(displayedState, 'white'),
     [displayedState]
@@ -375,21 +439,10 @@ export function App() {
   const isAITurn =
     !isSandboxMode &&
     !holdAIForImportedTurn &&
-    gameMode !== 'local' &&
+    gameMode === 'ai' &&
     currentState.currentTurn === 'black' &&
     !gameOver &&
     !isViewingHistory;
-
-  const aiDepth: SearchDepth =
-    gameMode === 'ai-1ply'
-      ? 1
-      : gameMode === 'ai-3ply'
-        ? 3
-        : gameMode === 'ai-4ply'
-          ? 4
-          : gameMode === 'ai-5ply'
-            ? 5
-            : 2;
 
   useEffect(() => {
     if (
@@ -404,13 +457,15 @@ export function App() {
   }, [validNextSteps, isAITurn, isViewingHistory, isReplayingOpponent]);
 
   useEffect(() => {
-    if (isSandboxMode || !rolledDice || isAITurn || gameOver) {
-      if (!isSandboxMode) setLiveAnalysis(null);
+    if (isSandboxMode || !rolledDice || isAITurn || gameOver || !showLiveHint) {
+      if (!isSandboxMode && (!rolledDice || isAITurn || gameOver)) {
+        setLiveAnalysis(null);
+      }
       return;
     }
 
     let cancelled = false;
-    analyzeTurn(turnStartState, rolledDice, 2).then((res) => {
+    analyzeLivePosition(turnStartState, rolledDice).then((res) => {
       if (!cancelled) {
         setLiveAnalysis(res);
       }
@@ -425,7 +480,8 @@ export function App() {
     rolledDice,
     isAITurn,
     gameOver,
-    analyzeTurn,
+    showLiveHint,
+    analyzeLivePosition,
   ]);
 
   useEffect(() => {
@@ -435,11 +491,13 @@ export function App() {
     }
 
     let cancelled = false;
-    analyzeTurn(sandboxTurnStartState, sandboxRolledDice, 2).then((res) => {
-      if (!cancelled) {
-        setSandboxAnalysis(res);
+    analyzeLivePosition(sandboxTurnStartState, sandboxRolledDice).then(
+      (res) => {
+        if (!cancelled) {
+          setSandboxAnalysis(res);
+        }
       }
-    });
+    );
 
     return () => {
       cancelled = true;
@@ -449,7 +507,7 @@ export function App() {
     sandboxTurnStartState,
     sandboxRolledDice,
     sandboxGameOver,
-    analyzeTurn,
+    analyzeLivePosition,
   ]);
 
   const handleEnterSandboxAtTurn = (turnIndex: number) => {
@@ -457,6 +515,7 @@ export function App() {
     if (!entry) return;
 
     clearPlaybackTimers();
+    setIsAIAnimating(false);
     setIsReplayingOpponent(false);
     setReplayBoardState(null);
     setAiStatusBanner(null);
@@ -499,6 +558,7 @@ export function App() {
 
   const startNewGame = (mode: GameMode = gameMode) => {
     clearPlaybackTimers();
+    clearAnalysisQueue();
     const initial = createInitialBoard();
     setGameMode(mode);
     setTurnStartState(initial);
@@ -516,6 +576,7 @@ export function App() {
     setSandboxOriginTurnIndex(null);
     setAiStatusBanner(null);
     setAiPlannedSteps(null);
+    setIsAIAnimating(false);
     setLastOpponentTurn(null);
     setShowLastOpponentArrows(false);
     setIsReplayingOpponent(false);
@@ -530,6 +591,7 @@ export function App() {
     sourceLabel: string
   ) => {
     clearPlaybackTimers();
+    clearAnalysisQueue();
     setIsScannerModalOpen(false);
     setIsSandboxMode(false);
     setSandboxOriginTurnIndex(null);
@@ -548,6 +610,7 @@ export function App() {
     setIsReplayingOpponent(false);
     setReplayBoardState(null);
     setAiPlannedSteps(null);
+    setIsAIAnimating(false);
     setAiStatusBanner(null);
     setImportedPositionLabel(sourceLabel || 'עמדה מיובאת מתמונה');
     // Pause AI auto-execution on the imported turn if Black is on roll so the user can study Black's optimal move arrows first
@@ -766,55 +829,81 @@ export function App() {
       setShowLastOpponentArrows(steps.length > 0);
     }
 
-    const evaluation = evaluatePosition(committedState);
-    const entryId = history.length + 1;
+    const instantEval = evaluatePosition(committedState);
+    const entryId = ++turnSequenceRef.current;
+    const turnId = `turn-${Date.now()}-${entryId}`;
 
     const initialEntry: HistoryEntry = {
       id: entryId,
-      turnNumber: entryId,
+      turnId,
+      turnNumber: history.length + 1,
       player,
-      dice,
-      steps,
+      dice: [dice[0], dice[1]],
+      steps: [...steps],
       notation,
-      turnStartState: startStateForTurn,
-      resultingState: committedState,
-      evalResult: evaluation,
+      turnStartState: cloneBoardState(startStateForTurn),
+      resultingState: cloneBoardState(committedState),
+      evalResult: instantEval,
+      isAnalyzing: !precomputedAnalysis,
       classification: precomputedAnalysis?.playedMoveAnalysis?.classification,
       equityLoss: precomputedAnalysis?.playedMoveAnalysis?.equityLoss,
+      playedEvaluation: precomputedAnalysis?.playedMoveAnalysis,
       analysis: precomputedAnalysis,
     };
 
     setHistory((prev) => [...prev, initialEntry]);
-    setTurnStartState(committedState);
-    setCurrentState(committedState);
-    setRolledDice(null);
+
+    // Dispatch player's turn into dedicated background `analysisWorker` FIFO queue (zero gameplay blocking!)
+    if (!precomputedAnalysis) {
+      void enqueueTurnAnalysis(
+        turnId,
+        cloneBoardState(startStateForTurn),
+        [dice[0], dice[1]],
+        [...steps],
+        handleBackgroundTurnAnalyzed
+      );
+    }
+
     setStepsTaken([]);
     setUndoStack([]);
     setSelectedFrom(null);
     setLiveAnalysis(null);
     setPreviewSteps(null);
     setAiPlannedSteps(null);
-    setAiStatusBanner(null);
+    setIsAIAnimating(false);
     setHoldAIForImportedTurn(false);
 
-    if (!precomputedAnalysis) {
-      analyzeTurn(startStateForTurn, dice, 2, steps, {
-        isBackground: true,
-      }).then((analysisRes) => {
-        setHistory((prev) =>
-          prev.map((item) =>
-            item.id === entryId
-              ? {
-                  ...item,
-                  classification:
-                    analysisRes.playedMoveAnalysis?.classification ?? 'Best',
-                  equityLoss: analysisRes.playedMoveAnalysis?.equityLoss ?? 0,
-                  analysis: analysisRes,
-                }
-              : item
-          )
-        );
-      });
+    // Simultaneously, with ZERO delay, roll AI's dice immediately when transitioning to AI turn
+    const isNextAITurn =
+      nextPlayer === 'black' &&
+      gameMode === 'ai' &&
+      !detectGameOver(committedState);
+
+    if (isNextAITurn) {
+      const d1 = Math.floor(Math.random() * 6) + 1;
+      const d2 = Math.floor(Math.random() * 6) + 1;
+      const aiDice: [number, number] = [d1, d2];
+      const expanded = d1 === d2 ? [d1, d1, d1, d1] : [d1, d2];
+      const aiStateWithDice: BoardState = {
+        ...committedState,
+        points: [...committedState.points],
+        bar: { ...committedState.bar },
+        borneOff: { ...committedState.borneOff },
+        dice: [...expanded],
+        remainingMoves: [...expanded],
+      };
+      setShowLastOpponentArrows(false);
+      setTurnStartState(aiStateWithDice);
+      setCurrentState(aiStateWithDice);
+      setRolledDice(aiDice);
+      setAiStatusBanner(
+        `היריב (שחור) הטיל ${d1}-${d2} — מחשב מהלך...`
+      );
+    } else {
+      setTurnStartState(committedState);
+      setCurrentState(committedState);
+      setRolledDice(null);
+      setAiStatusBanner(null);
     }
   };
 
@@ -925,10 +1014,14 @@ export function App() {
       try {
         const parsed = JSON.parse(String(reader.result));
         if (Array.isArray(parsed.history) && parsed.currentState) {
+          clearPlaybackTimers();
+          clearAnalysisQueue();
           setHistory(parsed.history);
           setCurrentState(parsed.currentState);
           setTurnStartState(parsed.currentState);
-          if (parsed.gameMode) setGameMode(parsed.gameMode);
+          if (parsed.gameMode) {
+            setGameMode(normalizeGameMode(parsed.gameMode));
+          }
           setRolledDice(null);
           setStepsTaken([]);
           setUndoStack([]);
@@ -943,19 +1036,16 @@ export function App() {
     reader.readAsText(file);
   };
 
-  // Paced, Staged AI Opponent Turn Execution:
-  // Stage 1 (500ms): "היריב (שחור) מטיל קוביות..." -> Roll dice
-  // Stage 2 (650ms): "היריב (שחור) משחק: [notation]" + Sky-blue planned move arrows
-  // Stage 3 (450ms per step): Apply each MoveStep one by one so the player sees every checker move
+  // Instant AI Opponent Turn Execution on Dedicated `gameplayWorker` (Depth 3+):
+  // - Rolls dice immediately with zero artificial delay if not already rolled
+  // - Computes move on `gameplayWorker` concurrently while `analysisWorker` reviews human move
+  // - Shows planned move arrows (650ms) and animates checkers step-by-step (450ms/step)
   useEffect(() => {
     if (!isAITurn) return;
 
     if (rolledDice === null) {
-      setAiStatusBanner('היריב (שחור) מטיל קוביות...');
-      const rollTimer = setTimeout(() => {
-        handleRollDice();
-      }, 500);
-      return () => clearTimeout(rollTimer);
+      handleRollDice();
+      return;
     }
 
     let cancelled = false;
@@ -963,15 +1053,17 @@ export function App() {
       `היריב (שחור) הטיל ${rolledDice[0]}-${rolledDice[1]} — מחשב מהלך...`
     );
 
-    analyzeTurn(turnStartState, rolledDice, aiDepth).then((analysisRes) => {
+    computeAIMove(turnStartState, rolledDice).then((analysisRes) => {
       if (cancelled) return;
 
       if (analysisRes.topMoves.length === 0) {
+        setIsAIAnimating(true);
         setAiStatusBanner(
           `היריב (שחור): ${rolledDice[0]}-${rolledDice[1]} — אין מהלכים חוקיים`
         );
         const passTimer = setTimeout(() => {
           if (cancelled) return;
+          setIsAIAnimating(false);
           commitTurnWithSteps(
             'black',
             rolledDice,
@@ -989,6 +1081,7 @@ export function App() {
       const fullNotation = `${rolledDice[0]}-${rolledDice[1]}: ${bestChoice.notation}`;
 
       // Stage 2: Show planned move arrows and banner for 650ms before moving checkers
+      setIsAIAnimating(true);
       setAiPlannedSteps(chosenSteps);
       setAiStatusBanner(`היריב (שחור) משחק: ${fullNotation}`);
 
@@ -1037,9 +1130,10 @@ export function App() {
 
     return () => {
       cancelled = true;
+      setIsAIAnimating(false);
       clearPlaybackTimers();
     };
-  }, [isAITurn, rolledDice, turnStartState, aiDepth, analyzeTurn]);
+  }, [isAITurn, rolledDice, turnStartState, computeAIMove]);
 
   const lastTurnSteps = useMemo(() => {
     if (isReplayingOpponent && lastOpponentTurn) {
@@ -1199,8 +1293,9 @@ export function App() {
             <div>
               <h1 className="text-base sm:text-lg font-bold tracking-tight text-white flex items-center gap-2">
                 שש-בש AI
-                <span className="hidden md:inline-block text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                  3-Net ResNet + עומק 5+
+                <span className="hidden sm:inline-flex items-center gap-1 text-[10px] font-semibold px-2.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-500/35">
+                  <Cpu className="w-3 h-3 text-cyan-400" />
+                  מנוע רב-אמן AI (עומק 3+)
                 </span>
               </h1>
               <p className="text-[11px] text-slate-400 hidden sm:block">
@@ -1209,98 +1304,37 @@ export function App() {
             </div>
           </div>
 
-          {/* Mode Selector (All 5 AI Depths + Local), Live Hint, Game Review Toggle & New Game */}
+          {/* Mode Selector ("נגד AI" vs "שני שחקנים"), Static Engine Badge, Scan, Live Hint & Game Review */}
           <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
-            {/* Compact Mobile/Tablet Select */}
-            <div className="xl:hidden">
-              <select
-                aria-label="בחירת מצב משחק ורמת AI"
-                value={gameMode}
-                onChange={(e) => setGameMode(e.target.value as GameMode)}
-                className="px-2.5 py-1.5 rounded-xl bg-slate-900 border border-slate-700 text-xs font-bold text-emerald-300 focus:outline-none focus:border-emerald-400 cursor-pointer"
+            {/* Game Mode Toggle: נגד AI vs שני שחקנים */}
+            <div
+              role="group"
+              aria-label="בחירת מצב משחק"
+              className="inline-flex rounded-xl bg-slate-900 p-1 border border-slate-800 gap-1"
+            >
+              <button
+                type="button"
+                onClick={() => setGameMode('ai')}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                  gameMode === 'ai'
+                    ? 'bg-cyan-400 text-slate-950 shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
               >
-                <option value="local">משחק זוגי (מקומי)</option>
-                <option value="ai-1ply">נגד מאמן AI (עומק 1)</option>
-                <option value="ai-2ply">נגד מאסטר AI (עומק 2+)</option>
-                <option value="ai-3ply">נגד רב-אמן AI (עומק 3+)</option>
-                <option value="ai-4ply">נגד אלוף-על AI (עומק 4+)</option>
-                <option value="ai-5ply">נגד אלגוריתם-על AI (עומק 5+)</option>
-              </select>
-            </div>
-
-            {/* Full Desktop Button Strip for All 5 AI Levels */}
-            <div className="hidden xl:inline-flex rounded-xl bg-slate-900 p-1 border border-slate-800 gap-0.5">
+                <Bot className="w-3.5 h-3.5" />
+                נגד AI
+              </button>
               <button
                 type="button"
                 onClick={() => setGameMode('local')}
-                className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
                   gameMode === 'local'
                     ? 'bg-emerald-500 text-slate-950 shadow'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 <Users className="w-3.5 h-3.5" />
-                משחק זוגי
-              </button>
-              <button
-                type="button"
-                onClick={() => setGameMode('ai-1ply')}
-                className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
-                  gameMode === 'ai-1ply'
-                    ? 'bg-emerald-500 text-slate-950 shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Bot className="w-3.5 h-3.5" />
-                נגד מאמן AI (עומק 1)
-              </button>
-              <button
-                type="button"
-                onClick={() => setGameMode('ai-2ply')}
-                className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
-                  gameMode === 'ai-2ply'
-                    ? 'bg-emerald-500 text-slate-950 shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Brain className="w-3.5 h-3.5" />
-                נגד מאסטר AI (עומק 2+)
-              </button>
-              <button
-                type="button"
-                onClick={() => setGameMode('ai-3ply')}
-                className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
-                  gameMode === 'ai-3ply'
-                    ? 'bg-cyan-400 text-slate-950 shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Brain className="w-3.5 h-3.5" />
-                נגד רב-אמן AI (עומק 3+)
-              </button>
-              <button
-                type="button"
-                onClick={() => setGameMode('ai-4ply')}
-                className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
-                  gameMode === 'ai-4ply'
-                    ? 'bg-purple-400 text-slate-950 shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                נגד אלוף-על AI (עומק 4+)
-              </button>
-              <button
-                type="button"
-                onClick={() => setGameMode('ai-5ply')}
-                className={`inline-flex items-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer ${
-                  gameMode === 'ai-5ply'
-                    ? 'bg-amber-400 text-slate-950 shadow'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Trophy className="w-3.5 h-3.5" />
-                נגד אלגוריתם-על AI (עומק 5+)
+                שני שחקנים
               </button>
             </div>
 
@@ -1539,15 +1573,7 @@ export function App() {
                       ? 'ארגז חול'
                       : gameMode === 'local'
                         ? 'שחקן 2'
-                        : gameMode === 'ai-1ply'
-                          ? 'מאמן AI (עומק 1)'
-                          : gameMode === 'ai-2ply'
-                            ? 'מאסטר AI (עומק 2+)'
-                            : gameMode === 'ai-3ply'
-                              ? 'רב-אמן AI (עומק 3+)'
-                              : gameMode === 'ai-4ply'
-                                ? 'אלוף-על AI (עומק 4+)'
-                                : 'אלגוריתם-על AI (עומק 5+)'}
+                        : 'מנוע רב-אמן AI (עומק 3+)'}
                   </span>
                   {displayedState.currentTurn === 'black' && !activeGameOver && (
                     <span className="text-[11px] text-emerald-400 font-semibold">
@@ -1747,9 +1773,7 @@ export function App() {
                     {aiStatusBanner || 'היריב (שחור) מבצע תור...'}
                     {isThinking && thinkingElapsedMs >= 100 && (
                       <span dir="ltr" className="mr-1.5 font-mono text-cyan-300">
-                        (עומק {aiDepth}
-                        {aiDepth >= 2 ? '+' : ''} •{' '}
-                        {(thinkingElapsedMs / 1000).toFixed(1)}s)
+                        (עומק 3+ • {(thinkingElapsedMs / 1000).toFixed(1)}s)
                       </span>
                     )}
                   </span>
@@ -1836,35 +1860,61 @@ export function App() {
           </div>
 
           {/* Stockfish-style Top-3 Engine Lines & Coach Analysis Panel */}
-          <AnalysisPanel
-            analysis={panelAnalysis}
-            isThinking={isThinking && !isViewingHistory}
-            thinkingDepth={thinkingDepth}
-            thinkingElapsedMs={thinkingElapsedMs}
-            activePlayer={panelPlayer}
-            dice={panelDice}
-            isViewingHistory={isViewingHistory}
-            historyTurnNumber={inspectedEntry?.turnNumber}
-            showLiveHint={showLiveHint}
-            onToggleLiveHint={() => setShowLiveHint((prev) => !prev)}
-            onHoverMoveSteps={setPreviewSteps}
-            onApplyRecommendedMove={
-              isSandboxMode
-                ? !sandboxGameOver
-                  ? handleApplyRecommendedMove
-                  : undefined
-                : !isViewingHistory &&
-                    !isAITurn &&
-                    !isReplayingOpponent &&
-                    !gameOver
-                  ? handleApplyRecommendedMove
-                  : undefined
-            }
-            onRunRollout={handleRunRollout}
-            isRollingOut={isRollingOut}
-            rolloutProgress={rolloutProgress}
-            rolloutResults={rolloutResults}
-          />
+          {(() => {
+            const isOpponentTurnOrAnimating =
+              !isViewingHistory &&
+              !isSandboxMode &&
+              ((gameMode === 'ai' &&
+                currentState.currentTurn === 'black' &&
+                !holdAIForImportedTurn) ||
+                isAIAnimating ||
+                isReplayingOpponent);
+
+            const hasGenuineNoLegalMovesForPanel = isViewingHistory
+              ? Boolean(
+                  inspectedEntry &&
+                    (inspectedEntry.steps.length === 0 ||
+                      (inspectedEntry.analysis !== undefined &&
+                        inspectedEntry.analysis.topMoves.length === 0 &&
+                        !inspectedEntry.isAnalyzing))
+                )
+              : !isOpponentTurnOrAnimating && hasNoLegalMoves;
+
+            return (
+              <AnalysisPanel
+                analysis={panelAnalysis}
+                isThinking={isThinking && !isViewingHistory}
+                thinkingElapsedMs={thinkingElapsedMs}
+                activePlayer={panelPlayer}
+                dice={panelDice}
+                isViewingHistory={isViewingHistory}
+                isHistoryTurnAnalyzing={Boolean(inspectedEntry?.isAnalyzing)}
+                historyTurnNumber={inspectedEntry?.turnNumber}
+                isOpponentTurnOrAnimating={isOpponentTurnOrAnimating}
+                hasGenuineNoLegalMoves={hasGenuineNoLegalMovesForPanel}
+                showLiveHint={showLiveHint}
+                onToggleLiveHint={() => setShowLiveHint((prev) => !prev)}
+                onHoverMoveSteps={setPreviewSteps}
+                onApplyRecommendedMove={
+                  isSandboxMode
+                    ? !sandboxGameOver
+                      ? handleApplyRecommendedMove
+                      : undefined
+                    : !isViewingHistory &&
+                        !isAITurn &&
+                        !isAIAnimating &&
+                        !isReplayingOpponent &&
+                        !gameOver
+                      ? handleApplyRecommendedMove
+                      : undefined
+                }
+                onRunRollout={handleRunRollout}
+                isRollingOut={isRollingOut}
+                rolloutProgress={rolloutProgress}
+                rolloutResults={rolloutResults}
+              />
+            );
+          })()}
         </div>
 
         {/* Sidebar: Move History & AI Badges */}

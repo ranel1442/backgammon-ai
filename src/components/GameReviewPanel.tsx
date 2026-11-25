@@ -96,13 +96,13 @@ export const GameReviewPanel: React.FC<GameReviewPanelProps> = ({
             <h2 className="text-sm font-bold text-white flex items-center gap-2">
               סיכום וניתוח משחק
               {pendingAnalysisCount > 0 && (
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 animate-pulse">
-                  מנתח {pendingAnalysisCount} תורות...
+                <span className="text-[10px] font-mono px-2.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 animate-pulse">
+                  משלים ניתוח {pendingAnalysisCount} תורות ברקע...
                 </span>
               )}
             </h2>
             <p className="text-[11px] text-slate-400">
-              מדד דיוק דו-שלבי (2-Ply) • גרף יתרון ורגעי מפתח במשחק
+              מדד דיוק רב-אמן (עומק 3+) • גרף יתרון ורגעי מפתח במשחק
             </p>
           </div>
         </div>

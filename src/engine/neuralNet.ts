@@ -41,17 +41,17 @@ export function classifyGamePhase(state: BoardState): GamePhase {
 export interface LayerWeightsJSON {
   inFeatures: number;
   outFeatures: number;
-  /** Flattened row-major weights of length `outFeatures * inFeatures` */
-  weights: number[];
+  /** Row-major weights of length `outFeatures * inFeatures` (1D flat or 2D `[outFeatures][inFeatures]`) */
+  weights: number[] | number[][];
   /** Bias vector of length `outFeatures` */
   bias: number[];
 }
 
 export interface ResidualBlockWeightsJSON {
   dim: number;
-  w1: number[];
+  w1: number[] | number[][];
   b1: number[];
-  w2: number[];
+  w2: number[] | number[][];
   b2: number[];
 }
 
@@ -60,13 +60,13 @@ export interface ResidualSubNetWeightsJSON {
   resDim: number;
   bottleneckDim: number;
   outDim: number;
-  inW: number[];
+  inW: number[] | number[][];
   inB: number[];
   resBlock?: ResidualBlockWeightsJSON;
   resBlocks?: ResidualBlockWeightsJSON[];
-  neckW: number[];
+  neckW: number[] | number[][];
   neckB: number[];
-  outW: number[];
+  outW: number[] | number[][];
   outB: number[];
 }
 
@@ -76,22 +76,22 @@ export interface NetworkWeightsJSON {
   h1Dim?: number;
   h2Dim?: number;
   outDim?: number;
-  w1?: number[];
+  w1?: number[] | number[][];
   b1?: number[];
-  w2?: number[];
+  w2?: number[] | number[][];
   b2?: number[];
-  w3?: number[];
+  w3?: number[] | number[][];
   b3?: number[];
   // Version 2 / Version 3 Residual fields
   resDim?: number;
   bottleneckDim?: number;
-  inW?: number[];
+  inW?: number[] | number[][];
   inB?: number[];
   resBlock?: ResidualBlockWeightsJSON;
   resBlocks?: ResidualBlockWeightsJSON[];
-  neckW?: number[];
+  neckW?: number[] | number[][];
   neckB?: number[];
-  outW?: number[];
+  outW?: number[] | number[][];
   outB?: number[];
 }
 
@@ -159,60 +159,57 @@ interface CompiledResidualSubNet {
   outLayer?: CompiledLayer;
 }
 
+function getRelPointCount(
+  points: readonly number[],
+  isWhite: boolean,
+  rel: number
+): number {
+  const raw = points[isWhite ? rel : 23 - rel];
+  return isWhite ? raw : -raw;
+}
+
 /**
- * Extracts the Ultimate 260-Feature Grandmaster canonical representation (`version: 3`)
- * for `perspective` ('white' | 'black').
- *
- * Feature Layout (100% identical between TypeScript and Python Numba `@njit`):
- * - [0..191]   (192 features): 24 points * 8 units, ordered from `perspective`'s 24-point down to 1-point.
- * - [192..209] (18 features):  Upgraded global features including exact bar blockage `(closed/6)^2`,
- *                              hit lethality `blotExposure * (oppClosed/6)`, timing ratio, double-anchor & 20-pt ownership.
- * - [210..233] (24 features):  Stripped Point indicators (`+1` if self has `count === 2`, `-1` if opp has `count === 2`).
- * - [234..257] (24 features):  Spare Builder indicators (`+1` if self has `count === 3 || 4`, `-1` if opp has `count === 3 || 4`).
- * - [258..259] (2 features):   Prime Trapping & Lethality products (`primeLen * trappedBackCheckers / 18`).
+ * Zero-allocation in-place extractor for the Ultimate 260-Feature Grandmaster canonical representation (`version: 3`).
+ * Writes directly into a pre-allocated `Float32Array(260)` buffer (`out`).
  */
-export function extractFeatures260(
+export function extractFeatures260Into(
   state: BoardState,
-  perspective: Player
+  perspective: Player,
+  out: Float32Array
 ): Float32Array {
-  const features = new Float32Array(NN_INPUT_DIM);
+  out.fill(0);
   const isWhite = perspective === 'white';
   const opponent: Player = isWhite ? 'black' : 'white';
-
-  const getRelCount = (rel: number): number => {
-    const absIdx = isWhite ? rel : 23 - rel;
-    const raw = state.points[absIdx];
-    return isWhite ? raw : -raw;
-  };
+  const points = state.points;
 
   // 1. [0..191]: 192 Point features + [210..257]: 48 Stripped & Spare Builder features
   for (let step = 0; step < 24; step++) {
     const rel = 23 - step;
-    const count = getRelCount(rel);
+    const count = getRelPointCount(points, isWhite, rel);
     const base = step * 8;
 
     if (count > 0) {
-      features[base] = 1.0;
-      if (count >= 2) features[base + 1] = 1.0;
-      if (count >= 3) features[base + 2] = 1.0;
-      if (count > 3) features[base + 3] = (count - 3) * 0.5;
+      out[base] = 1.0;
+      if (count >= 2) out[base + 1] = 1.0;
+      if (count >= 3) out[base + 2] = 1.0;
+      if (count > 3) out[base + 3] = (count - 3) * 0.5;
 
       if (count === 2) {
-        features[210 + step] = 1.0;
+        out[210 + step] = 1.0;
       } else if (count === 3 || count === 4) {
-        features[234 + step] = 1.0;
+        out[234 + step] = 1.0;
       }
     } else if (count < 0) {
       const oppCount = -count;
-      features[base + 4] = 1.0;
-      if (oppCount >= 2) features[base + 5] = 1.0;
-      if (oppCount >= 3) features[base + 6] = 1.0;
-      if (oppCount > 3) features[base + 7] = (oppCount - 3) * 0.5;
+      out[base + 4] = 1.0;
+      if (oppCount >= 2) out[base + 5] = 1.0;
+      if (oppCount >= 3) out[base + 6] = 1.0;
+      if (oppCount > 3) out[base + 7] = (oppCount - 3) * 0.5;
 
       if (oppCount === 2) {
-        features[210 + step] = -1.0;
+        out[210 + step] = -1.0;
       } else if (oppCount === 3 || oppCount === 4) {
-        features[234 + step] = -1.0;
+        out[234 + step] = -1.0;
       }
     }
   }
@@ -245,7 +242,7 @@ export function extractFeatures260(
   let oppBackCheckers = barOpp;
 
   for (let rel = 0; rel < 24; rel++) {
-    const c = getRelCount(rel);
+    const c = getRelPointCount(points, isWhite, rel);
     if (c > 0) {
       if (rel > highestSelfRel) highestSelfRel = rel;
       if (rel >= 6) {
@@ -285,7 +282,7 @@ export function extractFeatures260(
 
   if (isContact) {
     for (let rel = 0; rel < 24; rel++) {
-      const c = getRelCount(rel);
+      const c = getRelPointCount(points, isWhite, rel);
       if (c === 1 && rel > lowestOppRel) {
         blotExposureSelf++;
       } else if (c === -1 && rel < highestSelfRel) {
@@ -298,75 +295,85 @@ export function extractFeatures260(
   const closedRatioOpp = homePointsOpp / 6.0;
   const blotRatioSelf = Math.min(6, blotExposureSelf) / 6.0;
   const blotRatioOpp = Math.min(6, blotExposureOpp) / 6.0;
-  const golden20Owned = getRelCount(19) >= 2 ? 1.0 : 0.0;
+  const golden20Owned = getRelPointCount(points, isWhite, 19) >= 2 ? 1.0 : 0.0;
   const doubleAnchorIndicator = anchorsInOppHomeSelf >= 2 ? 1.0 : 0.0;
   const timingRatio = Math.min(
     2.0,
     outfieldAndBackPipSelf / Math.max(1.0, pipOpp)
   );
 
-  features[192] = barSelf / 2.0;
-  features[193] = barOpp / 2.0;
-  features[194] = borneOffSelf / 15.0;
-  features[195] = borneOffOpp / 15.0;
-  features[196] = pipSelf / 167.0;
-  features[197] = pipOpp / 167.0;
-  features[198] = (pipOpp - pipSelf) / 50.0;
-  features[199] = exactTurnsSelf / 20.0;
-  features[200] = exactTurnsOpp / 20.0;
-  features[201] = Math.min(6, maxPrimeSelf) / 6.0;
-  features[202] = Math.min(6, maxPrimeOpp) / 6.0;
-  features[203] = closedRatioSelf * closedRatioSelf; // Exact bar blockage prob by Self
-  features[204] = closedRatioOpp * closedRatioOpp; // Exact bar blockage prob by Opp
-  features[205] = blotRatioSelf * closedRatioOpp; // Hit lethality against Self
-  features[206] = blotRatioOpp * closedRatioSelf; // Hit lethality against Opp
-  features[207] = isContact ? 1.0 : 0.0;
-  features[208] = timingRatio / 2.0; // Timing / Backgame viability ratio
-  features[209] = 0.5 * doubleAnchorIndicator + 0.5 * golden20Owned;
+  out[192] = barSelf / 2.0;
+  out[193] = barOpp / 2.0;
+  out[194] = borneOffSelf / 15.0;
+  out[195] = borneOffOpp / 15.0;
+  out[196] = pipSelf / 167.0;
+  out[197] = pipOpp / 167.0;
+  out[198] = (pipOpp - pipSelf) / 50.0;
+  out[199] = exactTurnsSelf / 20.0;
+  out[200] = exactTurnsOpp / 20.0;
+  out[201] = Math.min(6, maxPrimeSelf) / 6.0;
+  out[202] = Math.min(6, maxPrimeOpp) / 6.0;
+  out[203] = closedRatioSelf * closedRatioSelf; // Exact bar blockage prob by Self
+  out[204] = closedRatioOpp * closedRatioOpp; // Exact bar blockage prob by Opp
+  out[205] = blotRatioSelf * closedRatioOpp; // Hit lethality against Self
+  out[206] = blotRatioOpp * closedRatioSelf; // Hit lethality against Opp
+  out[207] = isContact ? 1.0 : 0.0;
+  out[208] = timingRatio / 2.0; // Timing / Backgame viability ratio
+  out[209] = 0.5 * doubleAnchorIndicator + 0.5 * golden20Owned;
 
   // [258..259]: Prime Trapping & Lethality products
   const primeTrapSelf = Math.min(6, maxPrimeSelf) * Math.min(3, oppBackCheckers);
   const primeTrapOpp = Math.min(6, maxPrimeOpp) * Math.min(3, selfBackCheckers);
-  features[258] = primeTrapSelf / 18.0;
-  features[259] = primeTrapOpp / 18.0;
+  out[258] = primeTrapSelf / 18.0;
+  out[259] = primeTrapOpp / 18.0;
 
-  return features;
+  return out;
 }
 
 /**
- * Legacy 210-dimensional feature extractor preserved for backward compatibility
- * with Version 1 and Version 2 weight files.
+ * Extracts the Ultimate 260-Feature Grandmaster canonical representation (`version: 3`)
+ * for `perspective` ('white' | 'black').
  */
-export function extractFeatures210(
+export function extractFeatures260(
   state: BoardState,
   perspective: Player
 ): Float32Array {
-  const features = new Float32Array(NN_INPUT_DIM_V2);
+  return extractFeatures260Into(
+    state,
+    perspective,
+    new Float32Array(NN_INPUT_DIM)
+  );
+}
+
+/**
+ * Zero-allocation in-place legacy 210-dimensional feature extractor (`version: 1` / `version: 2`).
+ */
+export function extractFeatures210Into(
+  state: BoardState,
+  perspective: Player,
+  out: Float32Array
+): Float32Array {
+  out.fill(0);
   const isWhite = perspective === 'white';
   const opponent: Player = isWhite ? 'black' : 'white';
-
-  const getRelCount = (rel: number): number => {
-    const absIdx = isWhite ? rel : 23 - rel;
-    const raw = state.points[absIdx];
-    return isWhite ? raw : -raw;
-  };
+  const points = state.points;
 
   for (let step = 0; step < 24; step++) {
     const rel = 23 - step;
-    const count = getRelCount(rel);
+    const count = getRelPointCount(points, isWhite, rel);
     const base = step * 8;
 
     if (count > 0) {
-      features[base] = 1.0;
-      if (count >= 2) features[base + 1] = 1.0;
-      if (count >= 3) features[base + 2] = 1.0;
-      if (count > 3) features[base + 3] = (count - 3) * 0.5;
+      out[base] = 1.0;
+      if (count >= 2) out[base + 1] = 1.0;
+      if (count >= 3) out[base + 2] = 1.0;
+      if (count > 3) out[base + 3] = (count - 3) * 0.5;
     } else if (count < 0) {
       const oppCount = -count;
-      features[base + 4] = 1.0;
-      if (oppCount >= 2) features[base + 5] = 1.0;
-      if (oppCount >= 3) features[base + 6] = 1.0;
-      if (oppCount > 3) features[base + 7] = (oppCount - 3) * 0.5;
+      out[base + 4] = 1.0;
+      if (oppCount >= 2) out[base + 5] = 1.0;
+      if (oppCount >= 3) out[base + 6] = 1.0;
+      if (oppCount > 3) out[base + 7] = (oppCount - 3) * 0.5;
     }
   }
 
@@ -393,7 +400,7 @@ export function extractFeatures210(
   let homePointsOpp = 0;
 
   for (let rel = 0; rel < 24; rel++) {
-    const c = getRelCount(rel);
+    const c = getRelPointCount(points, isWhite, rel);
     if (c > 0 && rel > highestSelfRel) highestSelfRel = rel;
     if (c < 0 && rel < lowestOppRel) lowestOppRel = rel;
 
@@ -423,7 +430,7 @@ export function extractFeatures210(
 
   if (isContact) {
     for (let rel = 0; rel < 24; rel++) {
-      const c = getRelCount(rel);
+      const c = getRelPointCount(points, isWhite, rel);
       if (c === 1 && rel > lowestOppRel) {
         blotExposureSelf++;
       } else if (c === -1 && rel < highestSelfRel) {
@@ -432,72 +439,153 @@ export function extractFeatures210(
     }
 
     for (let rel = 18; rel <= 23; rel++) {
-      const c = getRelCount(rel);
+      const c = getRelPointCount(points, isWhite, rel);
       if (c > 0) {
         let blockedFront = 0;
         for (let s = 1; s <= 6; s++) {
-          if (rel - s >= 0 && getRelCount(rel - s) <= -2) blockedFront++;
+          if (rel - s >= 0 && getRelPointCount(points, isWhite, rel - s) <= -2)
+            blockedFront++;
         }
         if (blockedFront >= 3) trappedSelf += c;
       }
     }
 
     for (let rel = 0; rel <= 5; rel++) {
-      const c = getRelCount(rel);
+      const c = getRelPointCount(points, isWhite, rel);
       if (c < 0) {
         let blockedFront = 0;
         for (let s = 1; s <= 6; s++) {
-          if (rel + s < 24 && getRelCount(rel + s) >= 2) blockedFront++;
+          if (rel + s < 24 && getRelPointCount(points, isWhite, rel + s) >= 2)
+            blockedFront++;
         }
         if (blockedFront >= 3) trappedOpp += -c;
       }
     }
   }
 
-  features[192] = barSelf / 2.0;
-  features[193] = barOpp / 2.0;
-  features[194] = borneOffSelf / 15.0;
-  features[195] = borneOffOpp / 15.0;
-  features[196] = pipSelf / 167.0;
-  features[197] = pipOpp / 167.0;
-  features[198] = (pipOpp - pipSelf) / 50.0;
-  features[199] = exactTurnsSelf / 20.0;
-  features[200] = exactTurnsOpp / 20.0;
-  features[201] = Math.min(6, maxPrimeSelf) / 6.0;
-  features[202] = Math.min(6, maxPrimeOpp) / 6.0;
-  features[203] = homePointsSelf / 6.0;
-  features[204] = homePointsOpp / 6.0;
-  features[205] = Math.min(6, blotExposureSelf) / 6.0;
-  features[206] = Math.min(6, blotExposureOpp) / 6.0;
-  features[207] = isContact ? 1.0 : 0.0;
-  features[208] = Math.min(4, trappedSelf) / 4.0;
-  features[209] = Math.min(4, trappedOpp) / 4.0;
+  out[192] = barSelf / 2.0;
+  out[193] = barOpp / 2.0;
+  out[194] = borneOffSelf / 15.0;
+  out[195] = borneOffOpp / 15.0;
+  out[196] = pipSelf / 167.0;
+  out[197] = pipOpp / 167.0;
+  out[198] = (pipOpp - pipSelf) / 50.0;
+  out[199] = exactTurnsSelf / 20.0;
+  out[200] = exactTurnsOpp / 20.0;
+  out[201] = Math.min(6, maxPrimeSelf) / 6.0;
+  out[202] = Math.min(6, maxPrimeOpp) / 6.0;
+  out[203] = homePointsSelf / 6.0;
+  out[204] = homePointsOpp / 6.0;
+  out[205] = Math.min(6, blotExposureSelf) / 6.0;
+  out[206] = Math.min(6, blotExposureOpp) / 6.0;
+  out[207] = isContact ? 1.0 : 0.0;
+  out[208] = Math.min(4, trappedSelf) / 4.0;
+  out[209] = Math.min(4, trappedOpp) / 4.0;
 
-  return features;
+  return out;
+}
+
+/**
+ * Legacy 210-dimensional feature extractor preserved for backward compatibility
+ * with Version 1 and Version 2 weight files.
+ */
+export function extractFeatures210(
+  state: BoardState,
+  perspective: Player
+): Float32Array {
+  return extractFeatures210Into(
+    state,
+    perspective,
+    new Float32Array(NN_INPUT_DIM_V2)
+  );
+}
+
+function isWeightSequence(
+  val: unknown
+): val is number[] | number[][] | Float32Array {
+  return Array.isArray(val) || val instanceof Float32Array;
+}
+
+/**
+ * Flattens a 2D row-major `[outFeatures][inFeatures]` matrix, 1D `number[]`, or `Float32Array`
+ * into a single contiguous 1D row-major `Float32Array` buffer once at model load time
+ * for sequential CPU L1/L2 cache reads.
+ */
+export function flattenWeightMatrix(
+  weights: number[] | number[][] | Float32Array,
+  inFeatures: number,
+  outFeatures: number
+): Float32Array {
+  const expectedLen = inFeatures * outFeatures;
+
+  if (weights instanceof Float32Array) {
+    if (weights.length !== expectedLen) {
+      throw new Error(
+        `Layer Float32Array weight length mismatch: expected ${expectedLen}, got ${weights.length}`
+      );
+    }
+    return new Float32Array(weights);
+  }
+
+  if (weights.length > 0 && Array.isArray(weights[0])) {
+    const matrix2D = weights as number[][];
+    if (matrix2D.length !== outFeatures) {
+      throw new Error(
+        `2D weight row count mismatch: expected ${outFeatures}, got ${matrix2D.length}`
+      );
+    }
+    const flat = new Float32Array(expectedLen);
+    let offset = 0;
+    for (let r = 0; r < outFeatures; r++) {
+      const row = matrix2D[r];
+      if (row.length !== inFeatures) {
+        throw new Error(
+          `2D weight col count mismatch at row ${r}: expected ${inFeatures}, got ${row.length}`
+        );
+      }
+      for (let c = 0; c < inFeatures; c++) {
+        const v = row[c];
+        flat[offset++] = Number.isFinite(v) ? v : 0;
+      }
+    }
+    return flat;
+  }
+
+  const flatInput = weights as number[];
+  if (flatInput.length !== expectedLen) {
+    throw new Error(
+      `Layer weight length mismatch: expected ${expectedLen}, got ${flatInput.length}`
+    );
+  }
+  const out = new Float32Array(expectedLen);
+  for (let i = 0; i < expectedLen; i++) {
+    const v = flatInput[i];
+    out[i] = Number.isFinite(v) ? v : 0;
+  }
+  return out;
 }
 
 function makeCompiledLayer(
   inFeatures: number,
   outFeatures: number,
-  weights: number[],
-  bias: number[]
+  weights: number[] | number[][] | Float32Array,
+  bias: number[] | Float32Array
 ): CompiledLayer {
-  const expectedLen = inFeatures * outFeatures;
-  if (weights.length !== expectedLen) {
-    throw new Error(
-      `Layer weight length mismatch: expected ${expectedLen}, got ${weights.length}`
-    );
-  }
   if (bias.length !== outFeatures) {
     throw new Error(
       `Layer bias length mismatch: expected ${outFeatures}, got ${bias.length}`
     );
   }
+  const biasBuf = new Float32Array(outFeatures);
+  for (let i = 0; i < outFeatures; i++) {
+    const b = bias[i];
+    biasBuf[i] = Number.isFinite(b) ? b : 0;
+  }
   return {
     inFeatures,
     outFeatures,
-    weights: new Float32Array(weights),
-    bias: new Float32Array(bias),
+    weights: flattenWeightMatrix(weights, inFeatures, outFeatures),
+    bias: biasBuf,
   };
 }
 
@@ -516,13 +604,13 @@ function compileSubNetwork(netJson: NetworkWeightsJSON): CompiledResidualSubNet 
     typeof netJson.resDim === 'number' &&
     typeof netJson.bottleneckDim === 'number' &&
     typeof netJson.outDim === 'number' &&
-    Array.isArray(netJson.inW) &&
-    Array.isArray(netJson.inB) &&
+    isWeightSequence(netJson.inW) &&
+    isWeightSequence(netJson.inB) &&
     rawBlocks &&
-    Array.isArray(netJson.neckW) &&
-    Array.isArray(netJson.neckB) &&
-    Array.isArray(netJson.outW) &&
-    Array.isArray(netJson.outB)
+    isWeightSequence(netJson.neckW) &&
+    isWeightSequence(netJson.neckB) &&
+    isWeightSequence(netJson.outW) &&
+    isWeightSequence(netJson.outB)
   ) {
     const { inDim, resDim, bottleneckDim, outDim } = netJson;
     const compiledBlocks: CompiledResBlock[] = rawBlocks.map((rb) => ({
@@ -533,19 +621,24 @@ function compileSubNetwork(netJson: NetworkWeightsJSON): CompiledResidualSubNet 
     return {
       kind: 'residual',
       inDim,
-      inLayer: makeCompiledLayer(inDim, resDim, netJson.inW, netJson.inB),
+      inLayer: makeCompiledLayer(
+        inDim,
+        resDim,
+        netJson.inW,
+        netJson.inB as number[]
+      ),
       resBlocks: compiledBlocks,
       neckLayer: makeCompiledLayer(
         resDim,
         bottleneckDim,
         netJson.neckW,
-        netJson.neckB
+        netJson.neckB as number[]
       ),
       outLayer: makeCompiledLayer(
         bottleneckDim,
         outDim,
         netJson.outW,
-        netJson.outB
+        netJson.outB as number[]
       ),
     };
   }
@@ -590,29 +683,77 @@ function compileSubNetwork(netJson: NetworkWeightsJSON): CompiledResidualSubNet 
   };
 }
 
-function applyLinear(
-  layer: CompiledLayer,
+/**
+ * Lossless 4-way loop-unrolled (`j += 4`) row-major `Float32Array` matrix-vector multiplication (`gemv`):
+ * computes `out[o] = activation(bias[o] + dot(weights[o], input))` (or `out[o] += ...` when `accumulateResidual` is true)
+ * with sequential L1/L2 cache reads, zero heap allocations, and exact IEEE-754 left-to-right addition order.
+ */
+export function gemv(
+  weights: Float32Array,
+  bias: Float32Array,
   input: Float32Array,
-  applySiLU: boolean
-): Float32Array {
-  const { inFeatures, outFeatures, weights, bias } = layer;
-  const out = new Float32Array(outFeatures);
+  out: Float32Array,
+  inFeatures: number,
+  outFeatures: number,
+  applySiLU: boolean,
+  accumulateResidual = false
+): void {
+  const unrollLimit = inFeatures - 3;
   for (let o = 0; o < outFeatures; o++) {
-    let sum = bias[o];
     const rowOffset = o * inFeatures;
-    for (let i = 0; i < inFeatures; i++) {
-      sum += weights[rowOffset + i] * input[i];
+    let sum = bias[o];
+    let j = 0;
+    for (; j < unrollLimit; j += 4) {
+      const wIdx = rowOffset + j;
+      sum =
+        sum +
+        weights[wIdx] * input[j] +
+        weights[wIdx + 1] * input[j + 1] +
+        weights[wIdx + 2] * input[j + 2] +
+        weights[wIdx + 3] * input[j + 3];
     }
-    out[o] = applySiLU ? sum / (1.0 + Math.exp(-sum)) : sum;
+    for (; j < inFeatures; j++) {
+      sum += weights[rowOffset + j] * input[j];
+    }
+    const val = applySiLU
+      ? sum < -40
+        ? 0
+        : sum > 40
+          ? sum
+          : sum / (1.0 + Math.exp(-sum))
+      : sum;
+    if (accumulateResidual) {
+      out[o] += val;
+    } else {
+      out[o] = val;
+    }
   }
-  return out;
+}
+
+function createEmptyOutcomeProbabilities(): NNOutcomeProbabilities {
+  return {
+    winProb01: 0.5,
+    pWinSingle: 0.5,
+    pWinGammonOnly: 0,
+    pWinGammon: 0,
+    pWinBg: 0,
+    pLoseSingle: 0.5,
+    pLoseGammonOnly: 0,
+    pLoseGammon: 0,
+    pLoseBg: 0,
+    equity: 0,
+  };
 }
 
 /**
- * Converts raw output logits (either 6 logits `[WinSingle, WinGammonOnly, WinBg, LoseSingle, LoseGammonOnly, LoseBg]`
- * or 5 logits with implicit `LoseSingle = 0.0`) into normalized `NNOutcomeProbabilities`.
+ * Converts raw output logits (`outLen = 6` or `5`) in `logitsBuf` into normalized `NNOutcomeProbabilities`
+ * into `target` (zero-allocation when `target` is a pre-allocated scratch object).
  */
-function logitsToOutcomeProbabilities(logits: Float32Array): NNOutcomeProbabilities {
+function logitsToOutcomeProbabilitiesInto(
+  logitsBuf: Float32Array,
+  outLen: number,
+  target: NNOutcomeProbabilities
+): NNOutcomeProbabilities {
   let lWinSingle = 0;
   let lWinGammonOnly = 0;
   let lWinBg = 0;
@@ -620,20 +761,20 @@ function logitsToOutcomeProbabilities(logits: Float32Array): NNOutcomeProbabilit
   let lLoseGammonOnly = 0;
   let lLoseBg = 0;
 
-  if (logits.length >= 6) {
-    lWinSingle = logits[0];
-    lWinGammonOnly = logits[1];
-    lWinBg = logits[2];
-    lLoseSingle = logits[3];
-    lLoseGammonOnly = logits[4];
-    lLoseBg = logits[5];
+  if (outLen >= 6) {
+    lWinSingle = logitsBuf[0];
+    lWinGammonOnly = logitsBuf[1];
+    lWinBg = logitsBuf[2];
+    lLoseSingle = logitsBuf[3];
+    lLoseGammonOnly = logitsBuf[4];
+    lLoseBg = logitsBuf[5];
   } else {
-    lWinSingle = logits[0] ?? 0;
-    lWinGammonOnly = logits[1] ?? 0;
-    lWinBg = logits[2] ?? 0;
+    lWinSingle = logitsBuf[0] ?? 0;
+    lWinGammonOnly = logitsBuf[1] ?? 0;
+    lWinBg = logitsBuf[2] ?? 0;
     lLoseSingle = 0.0;
-    lLoseGammonOnly = logits[3] ?? 0;
-    lLoseBg = logits[4] ?? 0;
+    lLoseGammonOnly = logitsBuf[3] ?? 0;
+    lLoseBg = logitsBuf[4] ?? 0;
   }
 
   const maxLogit = Math.max(
@@ -653,6 +794,19 @@ function logitsToOutcomeProbabilities(logits: Float32Array): NNOutcomeProbabilit
   const eLoseB = Math.exp(lLoseBg - maxLogit);
 
   const denom = eWinS + eWinG + eWinB + eLoseS + eLoseG + eLoseB;
+  if (!Number.isFinite(denom) || denom <= 0) {
+    target.winProb01 = 0.5;
+    target.pWinSingle = 0.5;
+    target.pWinGammonOnly = 0;
+    target.pWinGammon = 0;
+    target.pWinBg = 0;
+    target.pLoseSingle = 0.5;
+    target.pLoseGammonOnly = 0;
+    target.pLoseGammon = 0;
+    target.pLoseBg = 0;
+    target.equity = 0;
+    return target;
+  }
 
   const pWinSingle = eWinS / denom;
   const pWinGammonOnly = eWinG / denom;
@@ -671,65 +825,18 @@ function logitsToOutcomeProbabilities(logits: Float32Array): NNOutcomeProbabilit
     (pWinGammon - pLoseGammon) +
     (pWinBg - pLoseBg);
 
-  return {
-    winProb01,
-    pWinSingle,
-    pWinGammonOnly,
-    pWinGammon,
-    pWinBg,
-    pLoseSingle,
-    pLoseGammonOnly,
-    pLoseGammon,
-    pLoseBg,
-    equity: Math.max(-3.0, Math.min(3.0, equity)),
-  };
-}
+  target.winProb01 = winProb01;
+  target.pWinSingle = pWinSingle;
+  target.pWinGammonOnly = pWinGammonOnly;
+  target.pWinGammon = pWinGammon;
+  target.pWinBg = pWinBg;
+  target.pLoseSingle = pLoseSingle;
+  target.pLoseGammonOnly = pLoseGammonOnly;
+  target.pLoseGammon = pLoseGammon;
+  target.pLoseBg = pLoseBg;
+  target.equity = Math.max(-3.0, Math.min(3.0, equity));
 
-/**
- * Executes a forward pass through a Version 3 / Version 2 Residual Sub-Network
- * (supporting 1, 2, or more stacked `ResidualBlock`s) or a Version 1 MLP Sub-Network.
- */
-function runSubNetForward(
-  subNet: CompiledResidualSubNet,
-  input: Float32Array
-): NNOutcomeProbabilities {
-  if (
-    subNet.kind === 'residual' &&
-    subNet.inLayer &&
-    subNet.resBlocks &&
-    subNet.neckLayer &&
-    subNet.outLayer
-  ) {
-    // 1. Input projection: inDim -> resDim (SiLU)
-    let x = applyLinear(subNet.inLayer, input, true);
-
-    // 2. Stacked ResidualBlock(resDim)s: x = x + SiLU(W2 * SiLU(W1 * x + b1) + b2)
-    for (const block of subNet.resBlocks) {
-      const h1 = applyLinear(block.layer1, x, true);
-      const h2 = applyLinear(block.layer2, h1, true);
-      const nextX = new Float32Array(x.length);
-      for (let i = 0; i < x.length; i++) {
-        nextX[i] = x[i] + h2[i];
-      }
-      x = nextX;
-    }
-
-    // 3. Bottleneck projection: resDim -> bottleneckDim (SiLU)
-    const neck = applyLinear(subNet.neckLayer, x, true);
-
-    // 4. Output head: bottleneckDim -> 6 logits
-    const logits = applyLinear(subNet.outLayer, neck, false);
-    return logitsToOutcomeProbabilities(logits);
-  }
-
-  // Fallback for Version 1 MLP layers
-  let current = input;
-  const layers = subNet.layers ?? [];
-  for (let l = 0; l < layers.length; l++) {
-    const isLast = l === layers.length - 1;
-    current = applyLinear(layers[l], current, !isLast);
-  }
-  return logitsToOutcomeProbabilities(current);
+  return target;
 }
 
 /**
@@ -737,11 +844,34 @@ function runSubNetForward(
  * - `contact`: 260 -> 512 (SiLU) -> ResidualBlock(512) -> ResidualBlock(512) -> 256 (SiLU) -> 6 (Softmax)
  * - `crashed`: 260 -> 384 (SiLU) -> ResidualBlock(384) -> 192 (SiLU) -> 6 (Softmax)
  * - `race`:    260 -> 384 (SiLU) -> ResidualBlock(384) -> 192 (SiLU) -> 6 (Softmax)
+ *
+ * Pre-allocates contiguous `Float32Array` scratchpads (`buf260`, `buf512a`, `buf512b`, `buf384a`, `buf384b`,
+ * `buf256`, `buf192`, `buf6`) once at construction time so every forward pass executes with **zero heap allocations**.
  */
 export class DualBackgammonNN {
   private readonly contactNet: CompiledResidualSubNet;
   private readonly crashedNet: CompiledResidualSubNet;
   private readonly raceNet: CompiledResidualSubNet;
+
+  // Pre-allocated reusable zero-GC scratchpad Float32Array buffers
+  private readonly buf260 = new Float32Array(260);
+  private readonly buf210 = new Float32Array(210);
+  private readonly buf512a = new Float32Array(512);
+  private readonly buf512b = new Float32Array(512);
+  private readonly buf384a = new Float32Array(384);
+  private readonly buf384b = new Float32Array(384);
+  private readonly buf256 = new Float32Array(256);
+  private readonly buf192 = new Float32Array(192);
+  private readonly buf6 = new Float32Array(6);
+
+  // Pre-allocated fallback buffers for any non-standard custom layer dimensions (e.g., v1 MLPs or custom unit tests)
+  private readonly customBufA = new Map<number, Float32Array>();
+  private readonly customBufB = new Map<number, Float32Array>();
+
+  // Reusable outcome probability scratchpads for symmetric dual-perspective evaluation
+  private readonly scratchWhiteOut = createEmptyOutcomeProbabilities();
+  private readonly scratchBlackOut = createEmptyOutcomeProbabilities();
+
   public readonly metadata: {
     version: number;
     trainedGames: number;
@@ -766,6 +896,10 @@ export class DualBackgammonNN {
     this.crashedNet = compileSubNetwork(rawCrashed);
     this.raceNet = compileSubNetwork(rawRace);
 
+    this.preallocateCustomDims(this.contactNet);
+    this.preallocateCustomDims(this.crashedNet);
+    this.preallocateCustomDims(this.raceNet);
+
     const trainedGames =
       weightsFile.trainedGames ?? weightsFile.gamesTrained ?? 0;
 
@@ -782,6 +916,62 @@ export class DualBackgammonNN {
     };
   }
 
+  private ensureCustomPair(dim: number): void {
+    if (
+      dim === 512 ||
+      dim === 384 ||
+      dim === 256 ||
+      dim === 192 ||
+      dim === 6 ||
+      dim === 260 ||
+      dim === 210
+    ) {
+      return;
+    }
+    if (!this.customBufA.has(dim)) {
+      this.customBufA.set(dim, new Float32Array(dim));
+      this.customBufB.set(dim, new Float32Array(dim));
+    }
+  }
+
+  private preallocateCustomDims(subNet: CompiledResidualSubNet): void {
+    this.ensureCustomPair(subNet.inDim);
+    if (subNet.inLayer) this.ensureCustomPair(subNet.inLayer.outFeatures);
+    if (subNet.neckLayer) this.ensureCustomPair(subNet.neckLayer.outFeatures);
+    if (subNet.outLayer) this.ensureCustomPair(subNet.outLayer.outFeatures);
+    if (subNet.layers) {
+      for (const l of subNet.layers) {
+        this.ensureCustomPair(l.inFeatures);
+        this.ensureCustomPair(l.outFeatures);
+      }
+    }
+  }
+
+  private getBufA(dim: number): Float32Array {
+    if (dim === 512) return this.buf512a;
+    if (dim === 384) return this.buf384a;
+    if (dim === 256) return this.buf256;
+    if (dim === 192) return this.buf192;
+    if (dim === 6) return this.buf6;
+    let buf = this.customBufA.get(dim);
+    if (!buf) {
+      buf = new Float32Array(dim);
+      this.customBufA.set(dim, buf);
+    }
+    return buf;
+  }
+
+  private getBufB(dim: number): Float32Array {
+    if (dim === 512) return this.buf512b;
+    if (dim === 384) return this.buf384b;
+    let buf = this.customBufB.get(dim);
+    if (!buf) {
+      buf = new Float32Array(dim);
+      this.customBufB.set(dim, buf);
+    }
+    return buf;
+  }
+
   public getVersion(): number {
     return this.metadata.version;
   }
@@ -792,33 +982,189 @@ export class DualBackgammonNN {
     return this.contactNet;
   }
 
+  private runSubNetForwardZeroAlloc(
+    subNet: CompiledResidualSubNet,
+    input: Float32Array,
+    target: NNOutcomeProbabilities
+  ): NNOutcomeProbabilities {
+    if (
+      subNet.kind === 'residual' &&
+      subNet.inLayer &&
+      subNet.resBlocks &&
+      subNet.neckLayer &&
+      subNet.outLayer
+    ) {
+      const inLayer = subNet.inLayer;
+      const neckLayer = subNet.neckLayer;
+      const outLayer = subNet.outLayer;
+
+      const resDim = inLayer.outFeatures;
+      const neckDim = neckLayer.outFeatures;
+      const outDim = outLayer.outFeatures;
+
+      const xBuf = this.getBufA(resDim);
+      const h1Buf = this.getBufB(resDim);
+      const neckBuf =
+        neckDim === resDim ? h1Buf : this.getBufA(neckDim);
+      const outBuf = outDim <= 6 ? this.buf6 : this.getBufA(outDim);
+
+      // 1. Input projection: inDim -> resDim (SiLU)
+      gemv(
+        inLayer.weights,
+        inLayer.bias,
+        input,
+        xBuf,
+        inLayer.inFeatures,
+        resDim,
+        true,
+        false
+      );
+
+      // 2. Stacked ResidualBlock(resDim)s: xBuf = xBuf + SiLU(W2 * SiLU(W1 * xBuf + b1) + b2)
+      const blocks = subNet.resBlocks;
+      for (let b = 0; b < blocks.length; b++) {
+        const block = blocks[b];
+        gemv(
+          block.layer1.weights,
+          block.layer1.bias,
+          xBuf,
+          h1Buf,
+          resDim,
+          resDim,
+          true,
+          false
+        );
+        gemv(
+          block.layer2.weights,
+          block.layer2.bias,
+          h1Buf,
+          xBuf,
+          resDim,
+          resDim,
+          true,
+          true
+        );
+      }
+
+      // 3. Bottleneck projection: resDim -> bottleneckDim (SiLU)
+      gemv(
+        neckLayer.weights,
+        neckLayer.bias,
+        xBuf,
+        neckBuf,
+        resDim,
+        neckDim,
+        true,
+        false
+      );
+
+      // 4. Output head: bottleneckDim -> outDim logits
+      gemv(
+        outLayer.weights,
+        outLayer.bias,
+        neckBuf,
+        outBuf,
+        neckDim,
+        outDim,
+        false,
+        false
+      );
+
+      return logitsToOutcomeProbabilitiesInto(outBuf, outDim, target);
+    }
+
+    // Fallback for Version 1 MLP layers using pre-allocated buffers
+    const layers = subNet.layers ?? [];
+    let current = input;
+    let lastLen = input.length;
+    for (let l = 0; l < layers.length; l++) {
+      const layer = layers[l];
+      const isLast = l === layers.length - 1;
+      const candidateOut = isLast && layer.outFeatures <= 6
+        ? this.buf6
+        : this.getBufA(layer.outFeatures);
+      const nextBuf =
+        candidateOut === current
+          ? this.getBufB(layer.outFeatures)
+          : candidateOut;
+      gemv(
+        layer.weights,
+        layer.bias,
+        current,
+        nextBuf,
+        layer.inFeatures,
+        layer.outFeatures,
+        !isLast,
+        false
+      );
+      current = nextBuf;
+      lastLen = layer.outFeatures;
+    }
+    return logitsToOutcomeProbabilitiesInto(current, lastLen, target);
+  }
+
+  private forwardPerspectiveInto(
+    state: BoardState,
+    perspective: Player,
+    phase: GamePhase,
+    target: NNOutcomeProbabilities
+  ): NNOutcomeProbabilities {
+    const subNet = this.selectSubNet(phase);
+    const features =
+      subNet.inDim === NN_INPUT_DIM
+        ? extractFeatures260Into(state, perspective, this.buf260)
+        : extractFeatures210Into(state, perspective, this.buf210);
+    return this.runSubNetForwardZeroAlloc(subNet, features, target);
+  }
+
+  private resolvePhase(
+    state: BoardState,
+    phaseOrIsPureRace?: GamePhase | boolean
+  ): GamePhase {
+    if (typeof phaseOrIsPureRace === 'string') {
+      return phaseOrIsPureRace;
+    }
+    if (typeof phaseOrIsPureRace === 'boolean') {
+      if (phaseOrIsPureRace) return 'race';
+      return classifyGamePhase(state) === 'crashed' ? 'crashed' : 'contact';
+    }
+    return classifyGamePhase(state);
+  }
+
   /**
    * Evaluates a board state from `perspective`'s viewpoint using the specialized
-   * Residual sub-network for the position's game phase (`contact` | `crashed` | `race`).
-   * Automatically dispatches 260-feature (v3) or 210-feature (v1/v2) extraction based on `subNet.inDim`.
+   * Residual sub-network for the position's game phase (`contact` | `crashed` | `race`)
+   * with zero typed-array heap allocations.
    */
   public forwardPerspective(
     state: BoardState,
     perspective: Player,
-    phaseOrIsPureRace?: GamePhase | boolean
+    phaseOrIsPureRace?: GamePhase | boolean,
+    outTarget?: NNOutcomeProbabilities
   ): NNOutcomeProbabilities {
-    const phase: GamePhase =
-      typeof phaseOrIsPureRace === 'string'
-        ? phaseOrIsPureRace
-        : typeof phaseOrIsPureRace === 'boolean'
-          ? phaseOrIsPureRace
-            ? 'race'
-            : classifyGamePhase(state) === 'crashed'
-              ? 'crashed'
-              : 'contact'
-          : classifyGamePhase(state);
+    const phase = this.resolvePhase(state, phaseOrIsPureRace);
+    return this.forwardPerspectiveInto(
+      state,
+      perspective,
+      phase,
+      outTarget ?? createEmptyOutcomeProbabilities()
+    );
+  }
 
-    const subNet = this.selectSubNet(phase);
-    const features =
-      subNet.inDim === NN_INPUT_DIM
-        ? extractFeatures260(state, perspective)
-        : extractFeatures210(state, perspective);
-    return runSubNetForward(subNet, features);
+  /**
+   * Alias for `evaluateSymmetric` / `forwardPerspective` zero-allocation inference.
+   */
+  public evaluate(
+    state: BoardState,
+    phaseOrIsPureRace?: GamePhase | boolean
+  ): {
+    equity: number;
+    winProb: number;
+    gammonProb: number;
+    backgammonProb: number;
+    phase: GamePhase;
+  } {
+    return this.evaluateSymmetric(state, phaseOrIsPureRace);
   }
 
   /**
@@ -833,7 +1179,8 @@ export class DualBackgammonNN {
 
   /**
    * Evaluates a board state with 100% White/Black symmetry by averaging
-   * White's perspective forward pass and Black's inverted perspective forward pass.
+   * White's perspective forward pass and Black's inverted perspective forward pass
+   * using pre-allocated reusable scratchpad buffers (zero typed-array heap allocations).
    */
   public evaluateSymmetric(
     state: BoardState,
@@ -845,19 +1192,20 @@ export class DualBackgammonNN {
     backgammonProb: number;
     phase: GamePhase;
   } {
-    const phase: GamePhase =
-      typeof phaseOrIsPureRace === 'string'
-        ? phaseOrIsPureRace
-        : typeof phaseOrIsPureRace === 'boolean'
-          ? phaseOrIsPureRace
-            ? 'race'
-            : classifyGamePhase(state) === 'crashed'
-              ? 'crashed'
-              : 'contact'
-          : classifyGamePhase(state);
+    const phase = this.resolvePhase(state, phaseOrIsPureRace);
 
-    const whitePred = this.forwardPerspective(state, 'white', phase);
-    const blackPred = this.forwardPerspective(state, 'black', phase);
+    const whitePred = this.forwardPerspectiveInto(
+      state,
+      'white',
+      phase,
+      this.scratchWhiteOut
+    );
+    const blackPred = this.forwardPerspectiveInto(
+      state,
+      'black',
+      phase,
+      this.scratchBlackOut
+    );
 
     const symEquity = 0.5 * (whitePred.equity - blackPred.equity);
     const symWinProb01 =
@@ -978,10 +1326,13 @@ function createResidualSubNetJSON(
  * - `crashed`: 260 -> 384 (SiLU) -> ResidualBlock(384) -> 192 (SiLU) -> 6 (Softmax)
  * - `race`:    260 -> 384 (SiLU) -> ResidualBlock(384) -> 192 (SiLU) -> 6 (Softmax)
  */
-export function createUntrainedDualNN(seed?: number): DualBackgammonNN {
+export function createUntrainedDualNN(
+  seed?: number,
+  trainedGames: number = 0
+): DualBackgammonNN {
   return new DualBackgammonNN({
     version: 3,
-    trainedGames: 0,
+    trainedGames,
     eloEstimate: 0,
     contact: createResidualSubNetJSON(
       NN_INPUT_DIM,
@@ -1012,6 +1363,8 @@ export function createUntrainedDualNN(seed?: number): DualBackgammonNN {
 
 let activeNeuralNet: DualBackgammonNN | null = null;
 let loadAttempted = false;
+let inFlightWeightsPromise: Promise<BackgammonNNWeightsFile | null> | null =
+  null;
 
 export function getActiveNeuralNet(): DualBackgammonNN | null {
   return activeNeuralNet;
@@ -1022,9 +1375,66 @@ export function setActiveNeuralNet(nn: DualBackgammonNN | null): void {
 }
 
 /**
- * Attempts to asynchronously fetch `/weights/backgammon_nn.json` using a Network-First
- * cache-busted request (`?t=timestamp`, falling back to cached URL when offline)
- * so newly exported weights from Python GPU training immediately appear in the UI.
+ * Initializes the active `DualBackgammonNN` directly from an already-fetched weights JSON object
+ * (used to share weights across `gameplayWorker` and `analysisWorker` without duplicate downloads).
+ */
+export function initNeuralNetFromWeightsJSON(
+  json: BackgammonNNWeightsFile | null | undefined
+): DualBackgammonNN | null {
+  if (!json) return activeNeuralNet;
+  if ((json.contact || json.contactNet) && (json.race || json.raceNet)) {
+    activeNeuralNet = new DualBackgammonNN(json);
+    loadAttempted = true;
+    return activeNeuralNet;
+  }
+  return activeNeuralNet;
+}
+
+/**
+ * Fetches `/weights/backgammon_nn.json` once (deduplicating concurrent calls in the same context)
+ * using a Network-First cache-busted request (`?t=timestamp`, falling back to cached URL offline).
+ */
+export async function fetchNeuralNetWeightsJSON(
+  url = '/weights/backgammon_nn.json'
+): Promise<BackgammonNNWeightsFile | null> {
+  if (inFlightWeightsPromise) {
+    return inFlightWeightsPromise;
+  }
+  if (typeof fetch === 'undefined') {
+    return null;
+  }
+
+  inFlightWeightsPromise = (async () => {
+    try {
+      const separator = url.includes('?') ? '&' : '?';
+      const bustUrl = `${url}${separator}t=${Date.now()}`;
+      let res: Response;
+      try {
+        res = await fetch(bustUrl, { cache: 'no-store' });
+      } catch {
+        res = await fetch(url);
+      }
+      if (!res.ok) return null;
+      const json = (await res.json()) as BackgammonNNWeightsFile;
+      if (
+        json &&
+        (json.contact || json.contactNet) &&
+        (json.race || json.raceNet)
+      ) {
+        initNeuralNetFromWeightsJSON(json);
+        return json;
+      }
+    } catch {
+      // Weights file not present yet; use hybrid heuristic + exact tablebase
+    }
+    return null;
+  })();
+
+  return inFlightWeightsPromise;
+}
+
+/**
+ * Attempts to asynchronously fetch and activate `/weights/backgammon_nn.json`.
  */
 export async function tryLoadNeuralNetWeights(
   url = '/weights/backgammon_nn.json'
@@ -1033,31 +1443,6 @@ export async function tryLoadNeuralNetWeights(
   if (loadAttempted) return null;
   loadAttempted = true;
 
-  if (typeof fetch === 'undefined') {
-    return null;
-  }
-
-  try {
-    const separator = url.includes('?') ? '&' : '?';
-    const bustUrl = `${url}${separator}t=${Date.now()}`;
-    let res: Response;
-    try {
-      res = await fetch(bustUrl, { cache: 'no-store' });
-    } catch {
-      res = await fetch(url);
-    }
-    if (!res.ok) return null;
-    const json = (await res.json()) as BackgammonNNWeightsFile;
-    if (
-      json &&
-      (json.contact || json.contactNet) &&
-      (json.race || json.raceNet)
-    ) {
-      activeNeuralNet = new DualBackgammonNN(json);
-      return activeNeuralNet;
-    }
-  } catch {
-    // Weights file not present yet; use hybrid heuristic + exact tablebase
-  }
-  return null;
+  const json = await fetchNeuralNetWeightsJSON(url);
+  return initNeuralNetFromWeightsJSON(json);
 }
