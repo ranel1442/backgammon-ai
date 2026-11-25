@@ -357,16 +357,194 @@ export function swapBoardColors(state: BoardState): BoardState {
 
 export const GEMINI_VISION_MODELS = [
   'gemini-2.5-flash',
+  'gemini-2.5-pro',
   'gemini-2.5-flash-lite',
-  'gemini-2.0-flash',
 ] as const;
 
 const RETRYABLE_HTTP_STATUSES = new Set([404, 429, 503]);
 
+interface AttemptError {
+  model: string;
+  status?: number;
+  message: string;
+}
+
+interface DiscoveredModelEntry {
+  name?: string;
+  supportedGenerationMethods?: string[];
+}
+
+function scoreDiscoveredModel(modelName: string): number {
+  const lower = modelName.toLowerCase();
+  let score = 0;
+  if (lower.includes('2.5')) score += 100;
+  else if (lower.includes('2.0')) score += 40;
+  if (lower.includes('flash') && !lower.includes('lite')) score += 30;
+  else if (lower.includes('pro')) score += 25;
+  else if (lower.includes('flash-lite') || lower.includes('lite')) score += 15;
+  if (!lower.includes('exp') && !lower.includes('preview')) score += 5;
+  return score;
+}
+
+async function discoverActiveGeminiVisionModels(
+  apiKey: string,
+  alreadyTried: Set<string>
+): Promise<string[]> {
+  const listEndpoint = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(listEndpoint, { method: 'GET' });
+  if (!res.ok) {
+    return [];
+  }
+
+  const json = (await res.json()) as { models?: DiscoveredModelEntry[] };
+  const rawModels = Array.isArray(json.models) ? json.models : [];
+  const excludedTerms = ['embedding', 'tts', 'imagen', 'aqa', 'veo'];
+
+  const candidates = rawModels
+    .filter((entry) => {
+      const methods = entry.supportedGenerationMethods ?? [];
+      if (!methods.includes('generateContent')) return false;
+      const shortName = (entry.name ?? '').replace(/^models\//, '');
+      const lower = shortName.toLowerCase();
+      if (!lower.includes('gemini')) return false;
+      if (excludedTerms.some((term) => lower.includes(term))) return false;
+      if (alreadyTried.has(shortName)) return false;
+      return shortName.length > 0;
+    })
+    .map((entry) => (entry.name ?? '').replace(/^models\//, ''))
+    .filter((name) => {
+      const lower = name.toLowerCase();
+      return lower.includes('flash') || lower.includes('pro');
+    });
+
+  candidates.sort((a, b) => scoreDiscoveredModel(b) - scoreDiscoveredModel(a));
+  return candidates.slice(0, 3);
+}
+
+async function invokeGeminiVisionModel(
+  modelName: string,
+  cleanKey: string,
+  mimeType: string,
+  data: string
+): Promise<ScannedBoardResponse> {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`;
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            { text: GEMINI_VISION_SYSTEM_PROMPT },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data,
+              },
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '');
+    const err = new Error(
+      `HTTP ${response.status}${errBody ? `: ${errBody.slice(0, 140)}` : ''}`
+    ) as Error & { status?: number };
+    err.status = response.status;
+    throw err;
+  }
+
+  const payload = await response.json();
+  const rawText: string | undefined =
+    payload?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+  if (!rawText) {
+    throw new Error('מנוע ה-AI לא החזיר תוצאת סריקה לתמונה זו.');
+  }
+
+  const parsed = extractJsonFromText(rawText);
+  const normalizedState = normalizeScannedBoard(parsed);
+
+  let parsedDice: [number, number] | null = null;
+  if (
+    Array.isArray(parsed.dice) &&
+    parsed.dice.length >= 2 &&
+    Number.isFinite(Number(parsed.dice[0])) &&
+    Number.isFinite(Number(parsed.dice[1]))
+  ) {
+    parsedDice = [
+      Math.max(1, Math.min(6, Math.round(Number(parsed.dice[0])))),
+      Math.max(1, Math.min(6, Math.round(Number(parsed.dice[1])))),
+    ];
+  }
+
+  const detectedTurn: Player | null =
+    parsed.detectedTurn === 'white' || parsed.detectedTurn === 'black'
+      ? parsed.detectedTurn
+      : null;
+
+  return {
+    points: normalizedState.points,
+    bar: normalizedState.bar,
+    borneOff: normalizedState.borneOff,
+    dice: parsedDice,
+    detectedTurn,
+    notes:
+      typeof parsed.notes === 'string' && parsed.notes.trim().length > 0
+        ? parsed.notes.trim()
+        : 'הלוח נסרק בהצלחה. מומלץ לוודא את מיקום הכלים לפני טעינת הניתוח.',
+  };
+}
+
+function buildAggregatedVisionError(attemptErrors: AttemptError[]): Error {
+  const summary = attemptErrors
+    .map((e) => `${e.model} (${e.status ?? 'ERR'}: ${e.message})`)
+    .join(' | ');
+
+  console.error('[VisionScanner] All attempted Gemini models failed:', summary);
+
+  const hasAuthError = attemptErrors.some(
+    (e) => e.status === 400 || e.status === 403
+  );
+  if (hasAuthError) {
+    return new Error(
+      `שגיאת אימות או הרשאה מול Gemini API. בדוק שמפתח ה-API תקין ופעיל. פירוט: ${summary}`
+    );
+  }
+
+  const hasQuotaError = attemptErrors.some((e) => e.status === 429);
+  if (hasQuotaError) {
+    return new Error(
+      `חריגה ממכסת הבקשות של Gemini API (429). המתן מספר שניות ונסה שוב, או ערוך את הלוח ידנית. פירוט: ${summary}`
+    );
+  }
+
+  const hasOverloadError = attemptErrors.some((e) => e.status === 503);
+  if (hasOverloadError) {
+    return new Error(
+      `שרתי Gemini Vision עמוסים כעת (503). נסה שוב בעוד מספר שניות או ערוך את הלוח ידנית. פירוט: ${summary}`
+    );
+  }
+
+  return new Error(
+    `סריקת התמונה נכשלה בכל המודלים (${summary}). ניתן גם לערוך את הלוח ידנית.`
+  );
+}
+
 /**
  * Calls Google Gemini Vision REST API with a multi-model fallback cascade
- * (`gemini-2.5-flash` -> `gemini-2.5-flash-lite` -> `gemini-2.0-flash`) on HTTP 429/503/404 errors
- * to analyze a Backgammon board screenshot or photo and return a structured `ScannedBoardResponse`.
+ * (`gemini-2.5-flash` -> `gemini-2.5-pro` -> `gemini-2.5-flash-lite`) on HTTP 429/503/404 errors,
+ * plus automatic Dynamic Model Discovery via `GET /v1beta/models` if all static models return 404.
  */
 export async function scanBackgammonImage(
   base64DataUrl: string,
@@ -383,118 +561,70 @@ export async function scanBackgammonImage(
     throw new Error('נתוני התמונה חסרים או לא תקינים.');
   }
 
-  let lastError: Error | null = null;
+  const attemptErrors: AttemptError[] = [];
+  const triedModels = new Set<string>();
 
   for (let i = 0; i < GEMINI_VISION_MODELS.length; i++) {
     const modelName = GEMINI_VISION_MODELS[i];
-    const isLastModel = i === GEMINI_VISION_MODELS.length - 1;
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`;
+    triedModels.add(modelName);
 
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { text: GEMINI_VISION_SYSTEM_PROMPT },
-                {
-                  inlineData: {
-                    mimeType,
-                    data,
-                  },
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.1,
-          },
-        }),
+      return await invokeGeminiVisionModel(modelName, cleanKey, mimeType, data);
+    } catch (err) {
+      const typedErr = err as Error & { status?: number };
+      const status = typedErr.status;
+      attemptErrors.push({
+        model: modelName,
+        status,
+        message: typedErr.message || 'Unknown error',
       });
 
-      if (!response.ok) {
-        const errBody = await response.text().catch(() => '');
-        // Automatically cascade to the next fallback model on 429, 503, or 404
-        if (RETRYABLE_HTTP_STATUSES.has(response.status) && !isLastModel) {
-          continue;
-        }
-        if (response.status === 429) {
-          throw new Error(
-            'חריגה ממכסת הבקשות של Gemini API (429) בכל המודלים. המתן מספר שניות ונסה שוב, או ערוך את הלוח ידנית.'
-          );
-        }
-        if (response.status === 503) {
-          throw new Error(
-            'שרתי Gemini Vision עמוסים כעת (503). נסה שוב בעוד מספר שניות או ערוך את הלוח ידנית.'
-          );
-        }
-        if (response.status === 400 || response.status === 403) {
-          throw new Error(
-            `שגיאת אימות מול Gemini API (${response.status}). בדוק שמפתח ה-API תקין.`
-          );
-        }
-        throw new Error(
-          `שגיאה בקריאה ל-Gemini Vision (${response.status}): ${errBody.slice(0, 120)}`
-        );
-      }
-
-      const payload = await response.json();
-      const rawText: string | undefined =
-        payload?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-      if (!rawText) {
-        throw new Error('מנוע ה-AI לא החזיר תוצאת סריקה לתמונה זו.');
-      }
-
-      const parsed = extractJsonFromText(rawText);
-      const normalizedState = normalizeScannedBoard(parsed);
-
-      let parsedDice: [number, number] | null = null;
-      if (
-        Array.isArray(parsed.dice) &&
-        parsed.dice.length >= 2 &&
-        Number.isFinite(Number(parsed.dice[0])) &&
-        Number.isFinite(Number(parsed.dice[1]))
-      ) {
-        parsedDice = [
-          Math.max(1, Math.min(6, Math.round(Number(parsed.dice[0])))),
-          Math.max(1, Math.min(6, Math.round(Number(parsed.dice[1])))),
-        ];
-      }
-
-      const detectedTurn: Player | null =
-        parsed.detectedTurn === 'white' || parsed.detectedTurn === 'black'
-          ? parsed.detectedTurn
-          : null;
-
-      return {
-        points: normalizedState.points,
-        bar: normalizedState.bar,
-        borneOff: normalizedState.borneOff,
-        dice: parsedDice,
-        detectedTurn,
-        notes:
-          typeof parsed.notes === 'string' && parsed.notes.trim().length > 0
-            ? parsed.notes.trim()
-            : 'הלוח נסרק בהצלחה. מומלץ לוודא את מיקום הכלים לפני טעינת הניתוח.',
-      };
-    } catch (err) {
-      lastError =
-        err instanceof Error
-          ? err
-          : new Error('אירעה שגיאה בלתי צפויה בסריקת התמונה.');
-      if (isLastModel) {
+      // Stop early on non-retryable HTTP errors (e.g., 400/401/403 invalid API key)
+      if (status !== undefined && !RETRYABLE_HTTP_STATUSES.has(status)) {
         break;
       }
     }
   }
 
-  throw (
-    lastError ?? new Error('סריקת התמונה נכשלה. ניתן גם לערוך את הלוח ידנית.')
-  );
+  // Dynamic Model Discovery fallback: if all static models returned 404, query active models list
+  const allStatic404 =
+    attemptErrors.length === GEMINI_VISION_MODELS.length &&
+    attemptErrors.every((e) => e.status === 404);
+
+  if (allStatic404) {
+    try {
+      const discovered = await discoverActiveGeminiVisionModels(
+        cleanKey,
+        triedModels
+      );
+      for (const dynamicModel of discovered) {
+        triedModels.add(dynamicModel);
+        try {
+          return await invokeGeminiVisionModel(
+            dynamicModel,
+            cleanKey,
+            mimeType,
+            data
+          );
+        } catch (err) {
+          const typedErr = err as Error & { status?: number };
+          attemptErrors.push({
+            model: dynamicModel,
+            status: typedErr.status,
+            message: typedErr.message || 'Unknown error',
+          });
+        }
+      }
+    } catch (discoveryErr) {
+      attemptErrors.push({
+        model: 'models-discovery',
+        message:
+          discoveryErr instanceof Error
+            ? discoveryErr.message
+            : 'Model discovery failed',
+      });
+    }
+  }
+
+  throw buildAggregatedVisionError(attemptErrors);
 }

@@ -107,11 +107,11 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
   });
 
   describe('scanBackgammonImage multi-model fallback cascade', () => {
-    it('cascades through gemini-2.5-flash -> gemini-2.5-flash-lite -> gemini-2.0-flash on HTTP 429/503', async () => {
+    it('cascades through gemini-2.5-flash -> gemini-2.5-pro -> gemini-2.5-flash-lite on HTTP 429/503', async () => {
       expect(GEMINI_VISION_MODELS).toEqual([
         'gemini-2.5-flash',
+        'gemini-2.5-pro',
         'gemini-2.5-flash-lite',
-        'gemini-2.0-flash',
       ]);
 
       const calledUrls: string[] = [];
@@ -122,7 +122,7 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
         if (urlStr.includes('gemini-2.5-flash:')) {
           return new Response('Rate limit exceeded', { status: 429 });
         }
-        if (urlStr.includes('gemini-2.5-flash-lite:')) {
+        if (urlStr.includes('gemini-2.5-pro:')) {
           return new Response('Service overloaded', { status: 503 });
         }
         return new Response(
@@ -159,10 +159,108 @@ describe('Vision Scanner & Board Calibration Helpers', () => {
 
         expect(calledUrls).toHaveLength(3);
         expect(calledUrls[0]).toContain('gemini-2.5-flash:generateContent');
-        expect(calledUrls[1]).toContain('gemini-2.5-flash-lite:generateContent');
-        expect(calledUrls[2]).toContain('gemini-2.0-flash:generateContent');
+        expect(calledUrls[1]).toContain('gemini-2.5-pro:generateContent');
+        expect(calledUrls[2]).toContain('gemini-2.5-flash-lite:generateContent');
         expect(res.dice).toEqual([6, 1]);
         expect(res.detectedTurn).toBe('white');
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('falls back to Dynamic Model Discovery (GET /v1beta/models) when all static models return HTTP 404', async () => {
+      const calledUrls: string[] = [];
+      const mockFetch = vi.fn(async (url: string | URL | Request) => {
+        const urlStr = String(url);
+        calledUrls.push(urlStr);
+
+        if (urlStr.endsWith('models?key=AIzaTestKey123')) {
+          return new Response(
+            JSON.stringify({
+              models: [
+                {
+                  name: 'models/text-embedding-004',
+                  supportedGenerationMethods: ['embedContent'],
+                },
+                {
+                  name: 'models/gemini-2.5-flash-tts',
+                  supportedGenerationMethods: ['generateContent'],
+                },
+                {
+                  name: 'models/gemini-3.0-flash-preview',
+                  supportedGenerationMethods: ['generateContent'],
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+
+        if (urlStr.includes('gemini-3.0-flash-preview:generateContent')) {
+          return new Response(
+            JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        text: JSON.stringify({
+                          points: createInitialBoard().points,
+                          bar: { white: 0, black: 0 },
+                          borneOff: { white: 0, black: 0 },
+                          dice: [5, 3],
+                          detectedTurn: 'black',
+                          notes: 'סריקה דינמית הצליחה',
+                        }),
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+
+        return new Response('Model not found', { status: 404 });
+      });
+
+      vi.stubGlobal('fetch', mockFetch);
+      try {
+        const res = await scanBackgammonImage(
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+          'AIzaTestKey123'
+        );
+
+        expect(calledUrls).toHaveLength(5);
+        expect(calledUrls[3]).toContain('/v1beta/models?key=AIzaTestKey123');
+        expect(calledUrls[4]).toContain(
+          'gemini-3.0-flash-preview:generateContent'
+        );
+        expect(res.dice).toEqual([5, 3]);
+        expect(res.detectedTurn).toBe('black');
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('aggregates errors across all attempted models so 429 quota is not masked behind a 404', async () => {
+      const mockFetch = vi.fn(async (url: string | URL | Request) => {
+        const urlStr = String(url);
+        if (urlStr.includes('gemini-2.5-flash:')) {
+          return new Response('Quota exceeded', { status: 429 });
+        }
+        return new Response('Model not found', { status: 404 });
+      });
+
+      vi.stubGlobal('fetch', mockFetch);
+      try {
+        await expect(
+          scanBackgammonImage(
+            'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+            'AIzaTestKey123'
+          )
+        ).rejects.toThrow(/429/);
       } finally {
         vi.unstubAllGlobals();
       }

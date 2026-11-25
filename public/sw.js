@@ -1,9 +1,11 @@
-const CACHE_NAME = 'backgammon-ai-master-v3';
+const CACHE_NAME = 'backgammon-ai-master-v4';
 const WEIGHTS_PATH = '/weights/backgammon_nn.json';
 const PRECACHE_URLS = [
   '/',
   '/index.html',
-  '/favicon.svg',
+  '/favicon.svg?v=3',
+  '/favicon.ico?v=3',
+  '/icon-192.png?v=3',
   '/manifest.webmanifest',
   WEIGHTS_PATH,
 ];
