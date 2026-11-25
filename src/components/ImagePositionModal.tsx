@@ -150,6 +150,27 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
     return () => window.removeEventListener('paste', handlePaste);
   }, [isOpen]);
 
+  // Live elapsed-seconds timer while scanning
+  useEffect(() => {
+    if (!isOpen || !isScanning) {
+      setScanElapsedSec(0);
+      return;
+    }
+    const start = Date.now();
+    const timer = window.setInterval(() => {
+      setScanElapsedSec(Math.floor((Date.now() - start) / 1000));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [isOpen, isScanning]);
+
+  // Abort any in-flight scan when the modal closes
+  useEffect(() => {
+    if (!isOpen && scanAbortRef.current) {
+      scanAbortRef.current.abort();
+      scanAbortRef.current = null;
+    }
+  }, [isOpen]);
+
   if (!isOpen) return null;
 
   const readFileToDataUrl = (file: File) => {
@@ -179,25 +200,6 @@ export const ImagePositionModal: React.FC<ImagePositionModalProps> = ({
       // Ignore storage errors
     }
   };
-
-  useEffect(() => {
-    if (!isScanning) {
-      setScanElapsedSec(0);
-      return;
-    }
-    const start = Date.now();
-    const timer = window.setInterval(() => {
-      setScanElapsedSec(Math.floor((Date.now() - start) / 1000));
-    }, 500);
-    return () => window.clearInterval(timer);
-  }, [isScanning]);
-
-  useEffect(() => {
-    if (!isOpen && scanAbortRef.current) {
-      scanAbortRef.current.abort();
-      scanAbortRef.current = null;
-    }
-  }, [isOpen]);
 
   const handleCancelScan = () => {
     if (scanAbortRef.current) {

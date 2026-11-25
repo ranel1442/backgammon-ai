@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { Board } from './components/Board';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { EvalBar } from './components/EvalBar';
 import { GameReviewPanel } from './components/GameReviewPanel';
 import { ImagePositionModal } from './components/ImagePositionModal';
@@ -1930,12 +1931,17 @@ export function App() {
       </main>
 
       {/* Scan & Analyze Board from Image Modal */}
-      <ImagePositionModal
-        isOpen={isScannerModalOpen}
-        initialBoardState={displayedState}
+      <ErrorBoundary
+        fallbackTitle="אירעה שגיאה בחלון סריקת התמונה"
         onClose={() => setIsScannerModalOpen(false)}
-        onConfirmPosition={handleConfirmScannedPosition}
-      />
+      >
+        <ImagePositionModal
+          isOpen={isScannerModalOpen}
+          initialBoardState={displayedState}
+          onClose={() => setIsScannerModalOpen(false)}
+          onConfirmPosition={handleConfirmScannedPosition}
+        />
+      </ErrorBoundary>
     </div>
   );
 }
