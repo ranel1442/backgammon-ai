@@ -84,10 +84,10 @@ export const GameReviewPanel: React.FC<GameReviewPanelProps> = ({
   return (
     <section
       dir="rtl"
-      className="rounded-2xl bg-slate-900/95 border border-slate-700/80 shadow-2xl overflow-hidden"
+      className="rounded-2xl bg-slate-900/95 border border-slate-700/80 shadow-2xl overflow-hidden max-h-[96dvh] flex flex-col"
     >
       {/* Top Header Bar */}
-      <div className="px-4 py-3 border-b border-slate-800 bg-slate-950/80 flex flex-wrap items-center justify-between gap-3">
+      <div className="px-3 sm:px-4 py-2.5 sm:py-3 border-b border-slate-800 bg-slate-950/80 flex flex-wrap items-center justify-between gap-2 sm:gap-3 shrink-0">
         <div className="flex items-center gap-2.5">
           <div className="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
             <BarChart3 className="w-4 h-4" />
@@ -200,7 +200,7 @@ export const GameReviewPanel: React.FC<GameReviewPanelProps> = ({
       </div>
 
       {/* Body Grid */}
-      <div className="p-4 space-y-4">
+      <div className="p-3 sm:p-4 space-y-4 overflow-y-auto flex-1">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {/* White Stats Card */}
           <div className="rounded-xl bg-slate-950/70 border border-slate-800 p-3.5 flex flex-col justify-between gap-3">

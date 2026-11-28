@@ -9,7 +9,11 @@ import {
   Dices,
   Download,
   FlaskConical,
+  History,
   Lightbulb,
+  Maximize2,
+  Menu,
+  Minimize2,
   Play,
   RotateCcw,
   ShieldAlert,
@@ -26,6 +30,7 @@ import { EvalBar } from './components/EvalBar';
 import { GameReviewPanel } from './components/GameReviewPanel';
 import { ImagePositionModal } from './components/ImagePositionModal';
 import { MoveHistory, type HistoryEntry } from './components/MoveHistory';
+import { RotatePhoneOverlay } from './components/RotatePhoneOverlay';
 import type { TurnAnalysisResult } from './engine/ai';
 import { evaluatePosition } from './engine/evaluator';
 import { computeGameReview } from './engine/review';
@@ -40,6 +45,7 @@ import {
 } from './engine/rules';
 import type { BoardState, MoveStep, Player } from './engine/types';
 import { useBackgammonAI } from './hooks/useBackgammonAI';
+import { useMobileLayout } from './hooks/useMobileLayout';
 
 type GameMode = 'ai' | 'local';
 
@@ -116,6 +122,19 @@ function getHebrewVictoryTitle(win: WinSummary): string {
   return `${winnerHe} — ניצחון רגיל (סינגל)!`;
 }
 
+function vibrateLight(ms = 12): void {
+  try {
+    if (
+      typeof navigator !== 'undefined' &&
+      typeof navigator.vibrate === 'function'
+    ) {
+      navigator.vibrate(ms);
+    }
+  } catch {
+    // Ignore unsupported environments such as iOS Safari
+  }
+}
+
 export function App() {
   const [gameMode, setGameMode] = useState<GameMode>('ai');
   const turnSequenceRef = useRef(0);
@@ -182,6 +201,23 @@ export function App() {
   const [deferredInstallPrompt, setDeferredInstallPrompt] =
     useState<BeforeInstallPromptEvent | null>(null);
 
+  // Mobile Landscape Cockpit & Drawer State
+  const { isPortrait, isMobileLandscape, isCompactMobile } = useMobileLayout();
+  const [mobileDrawer, setMobileDrawer] = useState<
+    'analysis' | 'history' | null
+  >(null);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [rotatePromptDismissed, setRotatePromptDismissed] = useState<boolean>(
+    () => {
+      try {
+        return sessionStorage.getItem('rotate_prompt_dismissed') === '1';
+      } catch {
+        return false;
+      }
+    }
+  );
+
   const {
     isThinking,
     thinkingElapsedMs,
@@ -207,6 +243,41 @@ export function App() {
     return () =>
       window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt);
   }, []);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () =>
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
+
+  const canUseFullscreen =
+    typeof document !== 'undefined' &&
+    Boolean(document.fullscreenEnabled) &&
+    typeof document.documentElement?.requestFullscreen === 'function';
+
+  const handleToggleFullscreen = async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await document.documentElement.requestFullscreen();
+      }
+    } catch {
+      // Ignore browser fullscreen restrictions
+    }
+  };
+
+  const handleDismissRotatePrompt = () => {
+    setRotatePromptDismissed(true);
+    try {
+      sessionStorage.setItem('rotate_prompt_dismissed', '1');
+    } catch {
+      // Ignore storage errors
+    }
+  };
 
   const handleInstallPwa = async () => {
     if (!deferredInstallPrompt) return;
@@ -634,6 +705,7 @@ export function App() {
       return;
     }
 
+    vibrateLight(12);
     const d1 = Math.floor(Math.random() * 6) + 1;
     const d2 = Math.floor(Math.random() * 6) + 1;
     const dicePair: [number, number] = [d1, d2];
@@ -917,6 +989,7 @@ export function App() {
     ) {
       return;
     }
+    vibrateLight(12);
     commitTurnWithSteps(
       activeCurrentState.currentTurn,
       activeRolledDice,
@@ -935,6 +1008,7 @@ export function App() {
     ) {
       return;
     }
+    vibrateLight(12);
     commitTurnWithSteps(
       activeCurrentState.currentTurn,
       activeRolledDice,
@@ -1277,6 +1351,687 @@ export function App() {
     showLastOpponentArrows,
     lastOpponentTurn,
   ]);
+
+  const isOpponentTurnOrAnimating =
+    !isViewingHistory &&
+    !isSandboxMode &&
+    ((gameMode === 'ai' &&
+      currentState.currentTurn === 'black' &&
+      !holdAIForImportedTurn) ||
+      isAIAnimating ||
+      isReplayingOpponent);
+
+  const hasGenuineNoLegalMovesForPanel = isViewingHistory
+    ? Boolean(
+        inspectedEntry &&
+          (inspectedEntry.steps.length === 0 ||
+            (inspectedEntry.analysis !== undefined &&
+              inspectedEntry.analysis.topMoves.length === 0 &&
+              !inspectedEntry.isAnalyzing))
+      )
+    : !isOpponentTurnOrAnimating && hasNoLegalMoves;
+
+  const analysisPanelElement = (
+    <AnalysisPanel
+      analysis={panelAnalysis}
+      isThinking={isThinking && !isViewingHistory}
+      thinkingElapsedMs={thinkingElapsedMs}
+      activePlayer={panelPlayer}
+      dice={panelDice}
+      isViewingHistory={isViewingHistory}
+      isHistoryTurnAnalyzing={Boolean(inspectedEntry?.isAnalyzing)}
+      historyTurnNumber={inspectedEntry?.turnNumber}
+      isOpponentTurnOrAnimating={isOpponentTurnOrAnimating}
+      hasGenuineNoLegalMoves={hasGenuineNoLegalMovesForPanel}
+      showLiveHint={showLiveHint}
+      onToggleLiveHint={() => setShowLiveHint((prev) => !prev)}
+      onHoverMoveSteps={setPreviewSteps}
+      onApplyRecommendedMove={
+        isSandboxMode
+          ? !sandboxGameOver
+            ? handleApplyRecommendedMove
+            : undefined
+          : !isViewingHistory &&
+              !isAITurn &&
+              !isAIAnimating &&
+              !isReplayingOpponent &&
+              !gameOver
+            ? handleApplyRecommendedMove
+            : undefined
+      }
+      onRunRollout={handleRunRollout}
+      isRollingOut={isRollingOut}
+      rolloutProgress={rolloutProgress}
+      rolloutResults={rolloutResults}
+    />
+  );
+
+  const canRollBoardDice =
+    !isViewingHistory &&
+    !isAITurn &&
+    !isReplayingOpponent &&
+    !activeGameOver &&
+    (isSandboxMode || activeRolledDice === null);
+
+  if (isCompactMobile) {
+    const showRotateOverlay =
+      isPortrait &&
+      !rotatePromptDismissed &&
+      !isScannerModalOpen &&
+      !showGameReview;
+
+    return (
+      <div
+        dir="rtl"
+        className="h-[100dvh] w-screen overflow-hidden bg-[#070b14] text-slate-100 flex flex-col font-sans safe-area-pad touch-board-surface"
+      >
+        {/* Main Mobile Cockpit: Landscape Side-by-Side OR Portrait Fallback Stack */}
+        {isMobileLandscape || !isPortrait ? (
+          <div className="flex-1 min-h-0 w-full flex flex-row items-stretch">
+            {/* Board + Slim Vertical EvalBar (~82-85% width, ~96% height) */}
+            <div
+              dir="ltr"
+              className="flex-1 min-w-0 h-full p-1.5 flex items-stretch gap-1.5"
+            >
+              <EvalBar evalResult={evalResult} compact={true} />
+              <Board
+                compact={true}
+                boardState={displayedState}
+                validNextSteps={validNextSteps}
+                validDestinationOptions={validDestinationOptions}
+                selectedFrom={selectedFrom}
+                onSelectFrom={setSelectedFrom}
+                onExecuteStep={handleExecuteStep}
+                onExecuteStepSequence={handleExecuteStepSequence}
+                isInteractive={
+                  isSandboxMode
+                    ? !sandboxGameOver
+                    : !isViewingHistory &&
+                      !isAITurn &&
+                      !isReplayingOpponent &&
+                      !gameOver
+                }
+                rolledDice={
+                  isReplayingOpponent && lastOpponentTurn
+                    ? lastOpponentTurn.dice
+                    : isSandboxMode
+                      ? sandboxRolledDice
+                      : inspectedEntry
+                        ? inspectedEntry.dice
+                        : rolledDice
+                }
+                stepsTaken={
+                  isReplayingOpponent
+                    ? replayStepsTaken
+                    : isSandboxMode
+                      ? sandboxStepsTaken
+                      : inspectedEntry
+                        ? inspectedEntry.steps
+                        : stepsTaken
+                }
+                lastTurnSteps={lastTurnSteps}
+                previewSteps={previewSteps}
+                primaryArrowSteps={primaryArrowSteps}
+                primaryArrowPlayer={primaryArrowPlayer}
+                secondaryArrowSteps={secondaryArrowSteps}
+                secondaryArrowPlayer={secondaryArrowPlayer}
+                secondaryArrowVariant={secondaryArrowVariant}
+                aiStatusBanner={aiStatusBanner}
+                onRollDice={handleRollDice}
+                canRollDice={canRollBoardDice}
+              />
+            </div>
+
+            {/* Thumb-Reachable Side Action Rail (126px) */}
+            <aside className="w-[126px] shrink-0 h-full bg-slate-950/95 border-r border-slate-800/90 p-1.5 flex flex-col justify-between gap-1.5">
+              {/* Compact Pips + Active Turn */}
+              <div className="space-y-1">
+                <div
+                  className={`flex items-center justify-between px-2 py-1 rounded-lg border text-[10px] ${
+                    displayedState.currentTurn === 'black' && !activeGameOver
+                      ? 'bg-slate-800/90 border-emerald-500/50 text-white'
+                      : 'bg-slate-900/70 border-slate-800 text-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-slate-900 border border-slate-400 shrink-0" />
+                    <span className="font-bold">שחור</span>
+                  </div>
+                  <span dir="ltr" className="font-mono font-bold">
+                    {blackPips}
+                  </span>
+                </div>
+
+                <div
+                  className={`flex items-center justify-between px-2 py-1 rounded-lg border text-[10px] ${
+                    displayedState.currentTurn === 'white' && !activeGameOver
+                      ? 'bg-stone-100/10 border-emerald-500/50 text-white'
+                      : 'bg-slate-900/70 border-slate-800 text-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-stone-100 border border-stone-400 shrink-0" />
+                    <span className="font-bold">לבן</span>
+                  </div>
+                  <span dir="ltr" className="font-mono font-bold">
+                    {whitePips}
+                  </span>
+                </div>
+
+                {isThinking && (
+                  <div className="px-2 py-1 rounded-lg bg-cyan-500/15 border border-cyan-500/35 text-[10px] text-cyan-200 font-mono flex items-center justify-center gap-1">
+                    <Brain className="w-3 h-3 animate-pulse text-cyan-400 shrink-0" />
+                    <span>{(thinkingElapsedMs / 1000).toFixed(1)}s</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Primary Thumb Action Area */}
+              <div className="flex flex-col gap-1.5 my-auto">
+                {isViewingHistory && viewingHistoryIndex !== null ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setViewingHistoryIndex(null)}
+                      className="w-full min-h-[48px] px-2 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs shadow-lg cursor-pointer"
+                    >
+                      חזור לחי
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleEnterSandboxAtTurn(viewingHistoryIndex)
+                      }
+                      className="w-full min-h-[44px] px-2 py-1.5 rounded-xl bg-cyan-500/20 text-cyan-200 border border-cyan-500/40 font-semibold text-[11px] cursor-pointer"
+                    >
+                      חקירה
+                    </button>
+                  </>
+                ) : isAITurn ? (
+                  <div className="w-full min-h-[48px] px-2 py-2 rounded-xl bg-slate-900 border border-slate-700 text-[11px] text-sky-300 font-semibold flex flex-col items-center justify-center text-center">
+                    <span>תור AI</span>
+                    <span className="text-[10px] text-slate-400">מחשב...</span>
+                  </div>
+                ) : hasNoLegalMoves ? (
+                  <button
+                    type="button"
+                    onClick={handlePassTurn}
+                    className="w-full min-h-[48px] px-2 py-2 rounded-xl bg-rose-500 text-white font-bold text-xs shadow-lg shadow-rose-500/30 animate-pulse cursor-pointer"
+                  >
+                    העבר תור
+                  </button>
+                ) : isTurnComplete ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={handleConfirmTurn}
+                      disabled={Boolean(activeGameOver) || isReplayingOpponent}
+                      className="w-full min-h-[48px] px-2 py-2 rounded-xl bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-extrabold text-xs shadow-[0_0_20px_rgba(16,185,129,0.45)] flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <Check className="w-4 h-4" />
+                      אשר תור
+                    </button>
+                    {activeStepsTaken.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleUndoStep}
+                        className="w-full min-h-[44px] px-2 py-1.5 rounded-xl bg-slate-800 text-slate-200 border border-slate-700 font-semibold text-xs flex items-center justify-center gap-1 cursor-pointer"
+                      >
+                        <Undo2 className="w-3.5 h-3.5" />
+                        בטל
+                      </button>
+                    )}
+                  </>
+                ) : activeRolledDice === null || isSandboxMode ? (
+                  <button
+                    type="button"
+                    onClick={handleRollDice}
+                    disabled={Boolean(activeGameOver) || isReplayingOpponent}
+                    className="w-full min-h-[48px] px-2 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-xs shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Dices className="w-4 h-4" />
+                    הטל קוביות
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleUndoStep}
+                    disabled={activeStepsTaken.length === 0}
+                    className={`w-full min-h-[48px] px-2 py-2 rounded-xl font-bold text-xs border flex items-center justify-center gap-1 ${
+                      activeStepsTaken.length > 0
+                        ? 'bg-slate-800 text-slate-100 border-slate-600 cursor-pointer'
+                        : 'bg-slate-900/60 text-slate-400 border-slate-800'
+                    }`}
+                  >
+                    <Undo2 className="w-3.5 h-3.5" />
+                    {activeStepsTaken.length > 0
+                      ? `בטל (${activeStepsTaken.length})`
+                      : 'בחר כלי'}
+                  </button>
+                )}
+              </div>
+
+              {/* 2x2 Quick-Access Icon Grid */}
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setMobileDrawer((prev) =>
+                      prev === 'analysis' ? null : 'analysis'
+                    )
+                  }
+                  className={`relative min-h-[44px] min-w-[44px] rounded-xl border flex flex-col items-center justify-center gap-0.5 text-[10px] font-semibold cursor-pointer ${
+                    mobileDrawer === 'analysis'
+                      ? 'bg-cyan-500/25 text-cyan-200 border-cyan-400'
+                      : 'bg-slate-900 text-slate-200 border-slate-800'
+                  }`}
+                >
+                  <Lightbulb className="w-4 h-4 text-cyan-400" />
+                  <span>רמז</span>
+                  {showLiveHint && (
+                    <span className="absolute top-1 left-1 w-2 h-2 rounded-full bg-cyan-400" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    setMobileDrawer((prev) =>
+                      prev === 'history' ? null : 'history'
+                    )
+                  }
+                  className={`relative min-h-[44px] min-w-[44px] rounded-xl border flex flex-col items-center justify-center gap-0.5 text-[10px] font-semibold cursor-pointer ${
+                    mobileDrawer === 'history'
+                      ? 'bg-emerald-500/25 text-emerald-200 border-emerald-400'
+                      : 'bg-slate-900 text-slate-200 border-slate-800'
+                  }`}
+                >
+                  <History className="w-4 h-4 text-emerald-400" />
+                  <span>היסטוריה</span>
+                  {history.length > 0 && (
+                    <span
+                      dir="ltr"
+                      className="absolute top-0.5 left-0.5 px-1 rounded-full bg-slate-800 text-[9px] font-mono text-slate-200"
+                    >
+                      {history.length}
+                    </span>
+                  )}
+                  {pendingAnalysisCount > 0 && (
+                    <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setIsScannerModalOpen(true)}
+                  className="min-h-[44px] min-w-[44px] rounded-xl bg-slate-900 text-slate-200 border border-slate-800 flex flex-col items-center justify-center gap-0.5 text-[10px] font-semibold cursor-pointer"
+                >
+                  <Camera className="w-4 h-4 text-cyan-300" />
+                  <span>סרוק</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setMobileMenuOpen(true)}
+                  className="min-h-[44px] min-w-[44px] rounded-xl bg-slate-900 text-slate-200 border border-slate-800 flex flex-col items-center justify-center gap-0.5 text-[10px] font-semibold cursor-pointer"
+                >
+                  <Menu className="w-4 h-4 text-slate-300" />
+                  <span>תפריט</span>
+                </button>
+              </div>
+            </aside>
+          </div>
+        ) : (
+          /* Clean Portrait Fallback when user dismissed Rotate Prompt */
+          <div className="flex-1 min-h-0 flex flex-col justify-between p-1.5 gap-1.5">
+            <div className="flex items-center justify-between gap-1.5 px-2 py-1 rounded-xl bg-slate-950/90 border border-slate-800 shrink-0">
+              <div className="flex items-center gap-2 text-[11px] font-mono">
+                <span className="text-slate-300">שחור: {blackPips}</span>
+                <span className="text-slate-600">|</span>
+                <span className="text-stone-100">לבן: {whitePips}</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setMobileDrawer('analysis')}
+                  className="min-w-[44px] min-h-[44px] rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-center"
+                  title="רמז"
+                >
+                  <Lightbulb className="w-4 h-4 text-cyan-400" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMobileDrawer('history')}
+                  className="min-w-[44px] min-h-[44px] rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-center"
+                  title="היסטוריה"
+                >
+                  <History className="w-4 h-4 text-emerald-400" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsScannerModalOpen(true)}
+                  className="min-w-[44px] min-h-[44px] rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-center"
+                  title="סרוק לוח"
+                >
+                  <Camera className="w-4 h-4 text-cyan-300" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMobileMenuOpen(true)}
+                  className="min-w-[44px] min-h-[44px] rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-center"
+                  title="תפריט"
+                >
+                  <Menu className="w-4 h-4 text-slate-200" />
+                </button>
+              </div>
+            </div>
+
+            <div dir="ltr" className="flex-1 min-h-0 flex items-stretch gap-1">
+              <EvalBar evalResult={evalResult} compact={true} />
+              <Board
+                compact={true}
+                boardState={displayedState}
+                validNextSteps={validNextSteps}
+                validDestinationOptions={validDestinationOptions}
+                selectedFrom={selectedFrom}
+                onSelectFrom={setSelectedFrom}
+                onExecuteStep={handleExecuteStep}
+                onExecuteStepSequence={handleExecuteStepSequence}
+                isInteractive={
+                  isSandboxMode
+                    ? !sandboxGameOver
+                    : !isViewingHistory &&
+                      !isAITurn &&
+                      !isReplayingOpponent &&
+                      !gameOver
+                }
+                rolledDice={
+                  isReplayingOpponent && lastOpponentTurn
+                    ? lastOpponentTurn.dice
+                    : isSandboxMode
+                      ? sandboxRolledDice
+                      : inspectedEntry
+                        ? inspectedEntry.dice
+                        : rolledDice
+                }
+                stepsTaken={
+                  isReplayingOpponent
+                    ? replayStepsTaken
+                    : isSandboxMode
+                      ? sandboxStepsTaken
+                      : inspectedEntry
+                        ? inspectedEntry.steps
+                        : stepsTaken
+                }
+                lastTurnSteps={lastTurnSteps}
+                previewSteps={previewSteps}
+                primaryArrowSteps={primaryArrowSteps}
+                primaryArrowPlayer={primaryArrowPlayer}
+                secondaryArrowSteps={secondaryArrowSteps}
+                secondaryArrowPlayer={secondaryArrowPlayer}
+                secondaryArrowVariant={secondaryArrowVariant}
+                aiStatusBanner={aiStatusBanner}
+                onRollDice={handleRollDice}
+                canRollDice={canRollBoardDice}
+              />
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              {isAITurn ? (
+                <div className="flex-1 min-h-[48px] rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center text-xs text-sky-300 font-semibold">
+                  {aiStatusBanner || 'היריב (שחור) מחשב מהלך...'}
+                </div>
+              ) : hasNoLegalMoves ? (
+                <button
+                  type="button"
+                  onClick={handlePassTurn}
+                  className="flex-1 min-h-[48px] rounded-xl bg-rose-500 text-white font-bold text-xs cursor-pointer"
+                >
+                  אין מהלכים חוקיים — העבר תור
+                </button>
+              ) : isTurnComplete ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={handleConfirmTurn}
+                    className="flex-1 min-h-[48px] rounded-xl bg-emerald-400 text-slate-950 font-extrabold text-xs cursor-pointer"
+                  >
+                    אשר תור
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleUndoStep}
+                    className="min-h-[48px] px-4 rounded-xl bg-slate-800 text-slate-200 border border-slate-700 font-semibold text-xs cursor-pointer"
+                  >
+                    בטל
+                  </button>
+                </>
+              ) : activeRolledDice === null ? (
+                <button
+                  type="button"
+                  onClick={handleRollDice}
+                  className="flex-1 min-h-[48px] rounded-xl bg-emerald-500 text-slate-950 font-extrabold text-xs cursor-pointer"
+                >
+                  הטל קוביות
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleUndoStep}
+                  disabled={activeStepsTaken.length === 0}
+                  className="flex-1 min-h-[48px] rounded-xl bg-slate-800 text-slate-200 border border-slate-700 font-semibold text-xs"
+                >
+                  בטל צעד ({activeStepsTaken.length})
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Slide-Over Drawer: Analysis or Move History */}
+        {mobileDrawer && (
+          <div className="fixed inset-0 z-40 flex justify-end bg-slate-950/65 backdrop-blur-xs">
+            <div
+              className="flex-1"
+              onClick={() => setMobileDrawer(null)}
+              aria-hidden="true"
+            />
+            <div className="w-[88vw] max-w-lg h-full bg-slate-950 border-r border-slate-800 shadow-2xl flex flex-col overflow-hidden safe-area-pad">
+              <div className="px-3 py-2 border-b border-slate-800 flex items-center justify-between bg-slate-900/90 shrink-0">
+                <span className="text-xs font-bold text-white">
+                  {mobileDrawer === 'analysis'
+                    ? 'ניתוח רב-אמן (עומק 3+)'
+                    : 'היסטוריית מהלכים'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileDrawer(null)}
+                  className="min-w-[44px] min-h-[44px] rounded-xl bg-slate-800 text-slate-200 flex items-center justify-center cursor-pointer"
+                  title="סגור"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-2">
+                {mobileDrawer === 'analysis' ? (
+                  analysisPanelElement
+                ) : (
+                  <MoveHistory
+                    history={history}
+                    viewingIndex={viewingHistoryIndex}
+                    onSelectHistoryIndex={(idx) => {
+                      setIsSandboxMode(false);
+                      setViewingHistoryIndex(idx);
+                      setMobileDrawer(null);
+                    }}
+                    onEnterSandboxAtTurn={(idx) => {
+                      handleEnterSandboxAtTurn(idx);
+                      setMobileDrawer(null);
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Compact Action Sheet Menu */}
+        {mobileMenuOpen && (
+          <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/75 backdrop-blur-sm p-4">
+            <div
+              className="absolute inset-0"
+              onClick={() => setMobileMenuOpen(false)}
+              aria-hidden="true"
+            />
+            <div className="relative w-full max-w-sm rounded-2xl bg-slate-900 border border-slate-700 p-4 space-y-2.5 shadow-2xl">
+              <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+                <span className="text-sm font-bold text-white">תפריט משחק</span>
+                <button
+                  type="button"
+                  onClick={() => setMobileMenuOpen(false)}
+                  className="p-2 rounded-lg bg-slate-800 text-slate-300 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGameMode('ai');
+                    setMobileMenuOpen(false);
+                  }}
+                  className={`min-h-[44px] rounded-xl text-xs font-bold border flex items-center justify-center gap-1.5 cursor-pointer ${
+                    gameMode === 'ai'
+                      ? 'bg-cyan-400 text-slate-950 border-cyan-300'
+                      : 'bg-slate-800 text-slate-300 border-slate-700'
+                  }`}
+                >
+                  <Bot className="w-4 h-4" />
+                  נגד AI
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGameMode('local');
+                    setMobileMenuOpen(false);
+                  }}
+                  className={`min-h-[44px] rounded-xl text-xs font-bold border flex items-center justify-center gap-1.5 cursor-pointer ${
+                    gameMode === 'local'
+                      ? 'bg-emerald-500 text-slate-950 border-emerald-400'
+                      : 'bg-slate-800 text-slate-300 border-slate-700'
+                  }`}
+                >
+                  <Users className="w-4 h-4" />
+                  שני שחקנים
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setShowGameReview(true);
+                  setMobileMenuOpen(false);
+                }}
+                className="w-full min-h-[44px] px-3 rounded-xl bg-amber-400/15 text-amber-200 border border-amber-400/40 text-xs font-bold flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <BarChart3 className="w-4 h-4" />
+                סיכום וניתוח משחק ({history.length})
+              </button>
+
+              {canUseFullscreen && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleToggleFullscreen();
+                    setMobileMenuOpen(false);
+                  }}
+                  className="w-full min-h-[44px] px-3 rounded-xl bg-slate-800 text-slate-200 border border-slate-700 text-xs font-bold flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  {isFullscreen ? (
+                    <Minimize2 className="w-4 h-4" />
+                  ) : (
+                    <Maximize2 className="w-4 h-4" />
+                  )}
+                  {isFullscreen ? 'צא ממסך מלא' : 'מסך מלא'}
+                </button>
+              )}
+
+              {deferredInstallPrompt && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleInstallPwa();
+                    setMobileMenuOpen(false);
+                  }}
+                  className="w-full min-h-[44px] px-3 rounded-xl bg-emerald-500/20 text-emerald-200 border border-emerald-500/40 text-xs font-bold flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  התקן כאפליקציה
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  startNewGame(gameMode);
+                  setMobileMenuOpen(false);
+                }}
+                className="w-full min-h-[44px] px-3 rounded-xl bg-rose-500/15 text-rose-200 border border-rose-500/40 text-xs font-bold flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <RotateCcw className="w-4 h-4" />
+                משחק חדש
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Full-Screen Game Review Modal on Mobile */}
+        {showGameReview && (
+          <div className="fixed inset-0 z-40 bg-slate-950/90 backdrop-blur-md p-2 flex items-center justify-center safe-area-pad">
+            <div className="w-full max-w-4xl">
+              <GameReviewPanel
+                review={gameReviewSummary}
+                selectedTurnIndex={viewingHistoryIndex}
+                onSelectTurnIndex={(idx) => {
+                  setIsSandboxMode(false);
+                  setViewingHistoryIndex(idx);
+                  setShowGameReview(false);
+                }}
+                onEnterSandboxAtTurn={(idx) => {
+                  handleEnterSandboxAtTurn(idx);
+                  setShowGameReview(false);
+                }}
+                onExportMatch={handleExportMatch}
+                onImportMatch={handleImportMatch}
+                onClose={() => setShowGameReview(false)}
+                pendingAnalysisCount={pendingAnalysisCount}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Portrait Rotate Prompt Overlay */}
+        {showRotateOverlay && (
+          <RotatePhoneOverlay onDismiss={handleDismissRotatePrompt} />
+        )}
+
+        {/* Scan & Analyze Board from Image Modal */}
+        <ErrorBoundary
+          fallbackTitle="אירעה שגיאה בחלון סריקת התמונה"
+          onClose={() => setIsScannerModalOpen(false)}
+        >
+          <ImagePositionModal
+            isOpen={isScannerModalOpen}
+            initialBoardState={displayedState}
+            onClose={() => setIsScannerModalOpen(false)}
+            onConfirmPosition={handleConfirmScannedPosition}
+          />
+        </ErrorBoundary>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -1861,61 +2616,7 @@ export function App() {
           </div>
 
           {/* Stockfish-style Top-3 Engine Lines & Coach Analysis Panel */}
-          {(() => {
-            const isOpponentTurnOrAnimating =
-              !isViewingHistory &&
-              !isSandboxMode &&
-              ((gameMode === 'ai' &&
-                currentState.currentTurn === 'black' &&
-                !holdAIForImportedTurn) ||
-                isAIAnimating ||
-                isReplayingOpponent);
-
-            const hasGenuineNoLegalMovesForPanel = isViewingHistory
-              ? Boolean(
-                  inspectedEntry &&
-                    (inspectedEntry.steps.length === 0 ||
-                      (inspectedEntry.analysis !== undefined &&
-                        inspectedEntry.analysis.topMoves.length === 0 &&
-                        !inspectedEntry.isAnalyzing))
-                )
-              : !isOpponentTurnOrAnimating && hasNoLegalMoves;
-
-            return (
-              <AnalysisPanel
-                analysis={panelAnalysis}
-                isThinking={isThinking && !isViewingHistory}
-                thinkingElapsedMs={thinkingElapsedMs}
-                activePlayer={panelPlayer}
-                dice={panelDice}
-                isViewingHistory={isViewingHistory}
-                isHistoryTurnAnalyzing={Boolean(inspectedEntry?.isAnalyzing)}
-                historyTurnNumber={inspectedEntry?.turnNumber}
-                isOpponentTurnOrAnimating={isOpponentTurnOrAnimating}
-                hasGenuineNoLegalMoves={hasGenuineNoLegalMovesForPanel}
-                showLiveHint={showLiveHint}
-                onToggleLiveHint={() => setShowLiveHint((prev) => !prev)}
-                onHoverMoveSteps={setPreviewSteps}
-                onApplyRecommendedMove={
-                  isSandboxMode
-                    ? !sandboxGameOver
-                      ? handleApplyRecommendedMove
-                      : undefined
-                    : !isViewingHistory &&
-                        !isAITurn &&
-                        !isAIAnimating &&
-                        !isReplayingOpponent &&
-                        !gameOver
-                      ? handleApplyRecommendedMove
-                      : undefined
-                }
-                onRunRollout={handleRunRollout}
-                isRollingOut={isRollingOut}
-                rolloutProgress={rolloutProgress}
-                rolloutResults={rolloutResults}
-              />
-            );
-          })()}
+          {analysisPanelElement}
         </div>
 
         {/* Sidebar: Move History & AI Badges */}

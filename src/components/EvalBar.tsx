@@ -3,6 +3,7 @@ import type { EvalResult } from '../engine/evaluator';
 
 interface EvalBarProps {
   evalResult: EvalResult;
+  compact?: boolean;
 }
 
 const SCALE_TICKS = [
@@ -13,7 +14,10 @@ const SCALE_TICKS = [
   { label: '+2.0', topPercent: 83.3 },
 ];
 
-export const EvalBar: React.FC<EvalBarProps> = ({ evalResult }) => {
+export const EvalBar: React.FC<EvalBarProps> = ({
+  evalResult,
+  compact = false,
+}) => {
   const {
     equity,
     winProb,
@@ -61,6 +65,50 @@ export const EvalBar: React.FC<EvalBarProps> = ({ evalResult }) => {
       : epcDiff > 0
         ? `לבן +${epcDiff.toFixed(1)}`
         : `שחור +${Math.abs(epcDiff).toFixed(1)}`;
+
+  if (compact) {
+    return (
+      <div
+        dir="ltr"
+        className="relative flex flex-col w-6 h-full rounded-xl overflow-hidden border border-slate-700/90 bg-slate-950 shadow-xl select-none shrink-0"
+      >
+        <div
+          className="w-full bg-gradient-to-b from-slate-950 via-slate-900 to-slate-800 transition-all duration-500 ease-out"
+          style={{ height: `${100 - whiteHeightPercent}%` }}
+        />
+        <div
+          className="w-full bg-gradient-to-t from-stone-100 via-stone-200 to-stone-300 transition-all duration-500 ease-out"
+          style={{ height: `${whiteHeightPercent}%` }}
+        />
+        <div
+          className="absolute inset-x-0 top-1/2 h-[2px] bg-emerald-500/70 pointer-events-none"
+        />
+        <div className="absolute top-1 inset-x-0 flex justify-center pointer-events-none">
+          <span className="text-[8px] font-mono font-extrabold text-stone-100 leading-none">
+            {blackWinProb.toFixed(0)}
+          </span>
+        </div>
+        <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 flex justify-center pointer-events-none">
+          <span
+            className={`px-0.5 py-0.5 rounded bg-slate-950/90 border border-slate-700/80 text-[8px] font-mono font-extrabold leading-none ${
+              equity > 0.05
+                ? 'text-emerald-400'
+                : equity < -0.05
+                  ? 'text-sky-400'
+                  : 'text-slate-200'
+            }`}
+          >
+            {formattedEquity}
+          </span>
+        </div>
+        <div className="absolute bottom-1 inset-x-0 flex justify-center pointer-events-none">
+          <span className="text-[8px] font-mono font-extrabold text-slate-950 leading-none">
+            {winProb.toFixed(0)}
+          </span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div

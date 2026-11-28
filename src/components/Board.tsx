@@ -23,6 +23,19 @@ interface BoardProps {
   secondaryArrowPlayer?: Player;
   secondaryArrowVariant?: 'opponent' | 'mistake';
   aiStatusBanner?: string | null;
+  compact?: boolean;
+  onRollDice?: () => void;
+  canRollDice?: boolean;
+}
+
+function triggerHaptic(ms = 12): void {
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      navigator.vibrate(ms);
+    }
+  } catch {
+    // Ignore unsupported environments such as iOS Safari
+  }
 }
 
 const TOP_LEFT_POINTS = [12, 13, 14, 15, 16, 17];
@@ -43,16 +56,24 @@ interface DieFaceProps {
   value: number;
   used: boolean;
   player: Player;
+  compact?: boolean;
 }
 
-const DieFace: React.FC<DieFaceProps> = ({ value, used, player }) => {
+const DieFace: React.FC<DieFaceProps> = ({
+  value,
+  used,
+  player,
+  compact = false,
+}) => {
   const pips = PIP_POSITIONS[value] || [];
   const isWhite = player === 'white';
 
   return (
     <div
       dir="ltr"
-      className={`relative w-10 h-10 sm:w-11 sm:h-11 rounded-xl p-1.5 grid grid-cols-3 grid-rows-3 gap-0.5 transition-all duration-300 shadow-lg border ${
+      className={`relative ${
+        compact ? 'w-8 h-8 rounded-lg p-1' : 'w-10 h-10 sm:w-11 sm:h-11 rounded-xl p-1.5'
+      } grid grid-cols-3 grid-rows-3 gap-0.5 transition-all duration-300 shadow-lg border ${
         used
           ? 'opacity-30 scale-90 bg-slate-800/80 border-slate-700'
           : isWhite
@@ -90,6 +111,7 @@ interface CheckerPieceProps {
   isMovable?: boolean;
   isSelected?: boolean;
   size?: 'normal' | 'bar';
+  compact?: boolean;
 }
 
 const CheckerPiece: React.FC<CheckerPieceProps> = ({
@@ -99,10 +121,14 @@ const CheckerPiece: React.FC<CheckerPieceProps> = ({
   isMovable = false,
   isSelected = false,
   size = 'normal',
+  compact = false,
 }) => {
   const isWhite = owner === 'white';
-  const sizeClasses =
-    size === 'bar'
+  const sizeClasses = compact
+    ? size === 'bar'
+      ? 'w-5 h-5'
+      : 'w-6 h-6'
+    : size === 'bar'
       ? 'w-8 h-8 sm:w-9 sm:h-9'
       : 'w-8 h-8 sm:w-10 sm:h-10';
 
@@ -162,8 +188,12 @@ export const Board: React.FC<BoardProps> = ({
   secondaryArrowPlayer = 'black',
   secondaryArrowVariant = 'opponent',
   aiStatusBanner = null,
+  compact = false,
+  onRollDice,
+  canRollDice = false,
 }) => {
   const boardContainerRef = useRef<HTMLDivElement | null>(null);
+  const lastTapRef = useRef<{ point: number; time: number } | null>(null);
 
   const effectivePrimaryArrows = previewSteps ?? primaryArrowSteps;
   const effectivePrimaryVariant: 'best' | 'preview' = previewSteps
@@ -216,6 +246,7 @@ export const Board: React.FC<BoardProps> = ({
   }
 
   const executeOption = (opt: ValidDestinationOption) => {
+    triggerHaptic(12);
     if (opt.steps.length > 1 && onExecuteStepSequence) {
       onExecuteStepSequence(opt.steps);
     } else {
@@ -258,11 +289,31 @@ export const Board: React.FC<BoardProps> = ({
 
     const targetOpt = targetOptionByPoint.get(pointIndex);
     if (targetOpt) {
+      lastTapRef.current = null;
       executeOption(targetOpt);
       return;
     }
 
     if (movableOrigins.has(pointIndex)) {
+      const now = Date.now();
+      const prevTap = lastTapRef.current;
+      // Quick Double-Tap Auto-Move (within 320ms): automatically plays highest available legal die for this checker
+      if (prevTap && prevTap.point === pointIndex && now - prevTap.time <= 320) {
+        lastTapRef.current = null;
+        const originSteps = validNextSteps.filter(
+          (s) => s.from === pointIndex
+        );
+        if (originSteps.length > 0) {
+          const highestStep = originSteps.reduce((best, curr) =>
+            curr.dieUsed > best.dieUsed ? curr : best
+          );
+          triggerHaptic(12);
+          onExecuteStep(highestStep);
+          return;
+        }
+      }
+      lastTapRef.current = { point: pointIndex, time: now };
+
       if (selectedFrom === pointIndex) {
         onSelectFrom(null);
       } else {
@@ -271,6 +322,7 @@ export const Board: React.FC<BoardProps> = ({
       return;
     }
 
+    lastTapRef.current = null;
     if (selectedFrom !== null) {
       onSelectFrom(null);
     }
@@ -320,7 +372,9 @@ export const Board: React.FC<BoardProps> = ({
         key={pointIndex}
         data-board-anchor={`point-${pointIndex}`}
         onClick={() => handlePointClick(pointIndex)}
-        className={`group/point relative flex-1 flex flex-col items-center justify-between h-[195px] sm:h-[225px] select-none transition-colors ${
+        className={`group/point relative flex-1 flex flex-col items-center justify-between ${
+          compact ? 'h-full min-h-0' : 'h-[195px] sm:h-[225px]'
+        } select-none transition-colors touch-board-surface ${
           isTarget || isMovableOrigin ? 'cursor-pointer' : 'cursor-default'
         }`}
       >
@@ -399,6 +453,7 @@ export const Board: React.FC<BoardProps> = ({
                     isTopOfStack={isTopChecker}
                     isMovable={isMovableOrigin}
                     isSelected={isSelectedOrigin}
+                    compact={compact}
                   />
                 );
               })}
@@ -480,7 +535,9 @@ export const Board: React.FC<BoardProps> = ({
     <div
       ref={boardContainerRef}
       dir="ltr"
-      className="relative flex-1 flex rounded-2xl bg-slate-950 border-2 border-slate-800 shadow-[0_20px_50px_rgba(0,0,0,0.75)] overflow-hidden"
+      className={`relative flex-1 flex rounded-2xl bg-slate-950 border-2 border-slate-800 shadow-[0_20px_50px_rgba(0,0,0,0.75)] overflow-hidden touch-board-surface ${
+        compact ? 'h-full min-h-0' : ''
+      }`}
     >
       {/* Tactical SVG Arrows Overlay */}
       <BoardArrows
@@ -494,9 +551,9 @@ export const Board: React.FC<BoardProps> = ({
       />
 
       {/* Main 4-Quadrant Board Area */}
-      <div className="flex-1 flex flex-col justify-between bg-[#0b1220] relative">
+      <div className="flex-1 flex flex-col justify-between bg-[#0b1220] relative min-h-0">
         {/* TOP HALF: Top-Left (12..17) | Central Bar | Top-Right Black Home (18..23) */}
-        <div className="flex items-stretch w-full">
+        <div className={`flex items-stretch w-full ${compact ? 'flex-1 min-h-0' : ''}`}>
           {/* Top-Left Quadrant (Points 12 to 17) */}
           <div className="flex-1 flex px-1.5 sm:px-2">
             {TOP_LEFT_POINTS.map((pt) => renderPointColumn(pt, true))}
@@ -506,7 +563,7 @@ export const Board: React.FC<BoardProps> = ({
           <div
             data-board-anchor="bar-white"
             onClick={handleBarClick}
-            className={`w-12 sm:w-14 bg-slate-900/95 border-x-2 border-slate-800 flex flex-col items-center justify-between py-2 select-none transition-colors ${
+            className={`${compact ? 'w-9' : 'w-12 sm:w-14'} bg-slate-900/95 border-x-2 border-slate-800 flex flex-col items-center justify-between ${compact ? 'py-1' : 'py-2'} select-none transition-colors ${
               isBarMovable ? 'cursor-pointer hover:bg-slate-800/90' : ''
             }`}
             title="בר (כלים שהוכו)"
@@ -523,6 +580,7 @@ export const Board: React.FC<BoardProps> = ({
                   <CheckerPiece
                     owner="white"
                     size="bar"
+                    compact={compact}
                     isTopOfStack={true}
                     isMovable={
                       isBarMovable && boardState.currentTurn === 'white'
@@ -552,33 +610,46 @@ export const Board: React.FC<BoardProps> = ({
         </div>
 
         {/* CENTER BOARD STRIP: Active 2D Dice & Turn Status */}
-        <div className="relative h-14 sm:h-16 flex items-center justify-between px-4 border-y border-slate-800/60 bg-slate-950/40">
+        <div
+          className={`relative ${compact ? 'h-10 px-2.5' : 'h-14 sm:h-16 px-4'} flex items-center justify-between border-y border-slate-800/60 bg-slate-950/40 shrink-0`}
+        >
           <div
             dir="rtl"
-            className="text-[11px] sm:text-xs font-medium text-slate-500"
+            className="text-[10px] sm:text-xs font-medium text-slate-500"
           >
             לוח חיצוני
           </div>
 
           {/* 2D Dice Display & Optional Paced AI Banner */}
-          <div className="flex items-center gap-3 z-20">
+          <div
+            onClick={() => {
+              if (canRollDice && onRollDice) {
+                triggerHaptic(12);
+                onRollDice();
+              }
+            }}
+            className={`flex items-center gap-2 sm:gap-3 z-20 ${
+              canRollDice && onRollDice ? 'cursor-pointer active:scale-95 transition-transform' : ''
+            }`}
+          >
             {aiStatusBanner && (
               <div
                 dir="rtl"
-                className="px-3 py-1 rounded-xl bg-sky-500/20 border border-sky-400/50 text-sky-200 text-xs font-bold shadow-lg animate-pulse"
+                className="px-2.5 py-0.5 sm:px-3 sm:py-1 rounded-xl bg-sky-500/20 border border-sky-400/50 text-sky-200 text-[10px] sm:text-xs font-bold shadow-lg animate-pulse"
               >
                 {aiStatusBanner}
               </div>
             )}
 
             {diceDisplayList.length > 0 ? (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 sm:gap-2">
                 {diceDisplayList.map((d, i) => (
                   <DieFace
                     key={i}
                     value={d.value}
                     used={d.used}
                     player={boardState.currentTurn}
+                    compact={compact}
                   />
                 ))}
               </div>
@@ -586,9 +657,13 @@ export const Board: React.FC<BoardProps> = ({
               !aiStatusBanner && (
                 <div
                   dir="rtl"
-                  className="px-3 py-1 rounded-lg bg-slate-900/80 border border-slate-800 text-xs text-slate-400"
+                  className={`px-2.5 py-1 rounded-lg border text-[10px] sm:text-xs ${
+                    canRollDice
+                      ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200 font-bold'
+                      : 'bg-slate-900/80 border-slate-800 text-slate-400'
+                  }`}
                 >
-                  ממתין להטלת קוביות
+                  {canRollDice ? 'לחץ להטלת קוביות' : 'ממתין להטלת קוביות'}
                 </div>
               )
             )}
@@ -596,14 +671,14 @@ export const Board: React.FC<BoardProps> = ({
 
           <div
             dir="rtl"
-            className="text-[11px] sm:text-xs font-medium text-slate-500"
+            className="text-[10px] sm:text-xs font-medium text-slate-500"
           >
             בית (הוצאה)
           </div>
         </div>
 
         {/* BOTTOM HALF: Bottom-Left (11..6) | Central Bar | Bottom-Right White Home (5..0) */}
-        <div className="flex items-stretch w-full">
+        <div className={`flex items-stretch w-full ${compact ? 'flex-1 min-h-0' : ''}`}>
           {/* Bottom-Left Quadrant (Points 11 down to 6) */}
           <div className="flex-1 flex px-1.5 sm:px-2">
             {BOTTOM_LEFT_POINTS.map((pt) => renderPointColumn(pt, false))}
@@ -613,7 +688,7 @@ export const Board: React.FC<BoardProps> = ({
           <div
             data-board-anchor="bar-black"
             onClick={handleBarClick}
-            className={`w-12 sm:w-14 bg-slate-900/95 border-x-2 border-slate-800 flex flex-col items-center justify-between py-2 select-none transition-colors ${
+            className={`${compact ? 'w-9' : 'w-12 sm:w-14'} bg-slate-900/95 border-x-2 border-slate-800 flex flex-col items-center justify-between ${compact ? 'py-1' : 'py-2'} select-none transition-colors ${
               isBarMovable ? 'cursor-pointer hover:bg-slate-800/90' : ''
             }`}
             title="בר (כלים שהוכו)"
@@ -625,6 +700,7 @@ export const Board: React.FC<BoardProps> = ({
                   <CheckerPiece
                     owner="black"
                     size="bar"
+                    compact={compact}
                     isTopOfStack={true}
                     isMovable={
                       isBarMovable && boardState.currentTurn === 'black'
@@ -660,7 +736,9 @@ export const Board: React.FC<BoardProps> = ({
       </div>
 
       {/* RIGHT BEAR-OFF TRAYS (Top: Black Borne-Off, Bottom: White Borne-Off) */}
-      <div className="w-16 sm:w-20 bg-slate-950 border-l-2 border-slate-800 flex flex-col justify-between p-1.5 sm:p-2 select-none shrink-0">
+      <div
+        className={`${compact ? 'w-12 p-1' : 'w-16 sm:w-20 p-1.5 sm:p-2'} bg-slate-950 border-l-2 border-slate-800 flex flex-col justify-between select-none shrink-0`}
+      >
         {/* Black Bear-Off Tray (Top) */}
         {(() => {
           const isBlackBearOffTarget =

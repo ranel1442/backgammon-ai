@@ -1,4 +1,4 @@
-const CACHE_NAME = 'backgammon-ai-v5';
+const CACHE_NAME = 'backgammon-ai-v6';
 const WEIGHTS_PATH = '/weights/backgammon_nn.json';
 const PRECACHE_URLS = [
   '/',
